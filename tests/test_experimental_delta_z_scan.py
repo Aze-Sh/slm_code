@@ -267,3 +267,151 @@ def test_acquisition_refuses_nonempty_output_directory(scan_module, tmp_path):
         )
 
     assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def _gaussian_grid(shape, centers, sigma, amplitudes, background=2.0):
+    y, x = np.indices(shape, dtype=np.float64)
+    image = np.full(shape, background, dtype=np.float64)
+    for (center_y, center_x), amplitude in zip(centers, amplitudes):
+        radius_squared = (y - center_y) ** 2 + (x - center_x) ** 2
+        image += amplitude * np.exp(-radius_squared / (2 * sigma**2))
+    return image
+
+
+def _acquired_from_images(scan_module, tmp_path, images, saturation=None):
+    results = []
+    saturation = saturation or [0.0] * len(images)
+    for index, (image, fraction) in enumerate(zip(images, saturation)):
+        delta_z = float(index * 5)
+        label = f"scan_{index:03d}_delta_z_p{delta_z:07.3f}mm"
+        bitmap = tmp_path / f"slm_phase_{label}.bmp"
+        Image.fromarray(np.zeros((4, 6), dtype=np.uint8), mode="L").save(
+            bitmap
+        )
+        average_npy = tmp_path / f"camera_average_{label}.npy"
+        average_tiff = tmp_path / f"camera_average_{label}.tiff"
+        np.save(average_npy, image)
+        Image.fromarray(np.asarray(image, dtype=np.uint16)).save(average_tiff)
+        results.append(
+            scan_module.AcquiredPoint(
+                point=scan_module.ScanPoint(delta_z, bitmap, label),
+                average=np.asarray(image, dtype=np.float64),
+                saturation_fraction=fraction,
+                peak_raw=float(np.max(image)),
+                average_npy=average_npy,
+                average_tiff=average_tiff,
+                raw_frames_npy=None,
+            )
+        )
+    return results
+
+
+def test_common_spots_and_metrics_prefer_sharp_uniform_low_halo_image(
+    scan_module, tmp_path
+):
+    expected_centers = np.array(
+        [[20, 20], [20, 44], [44, 20], [44, 44]], dtype=int
+    )
+    sharp = _gaussian_grid(
+        (64, 64), expected_centers, sigma=1.2, amplitudes=[100] * 4
+    )
+    blurred = _gaussian_grid(
+        (64, 64),
+        expected_centers,
+        sigma=3.2,
+        amplitudes=[100, 80, 60, 40],
+    )
+    acquired = _acquired_from_images(scan_module, tmp_path, [sharp, blurred])
+
+    centers = scan_module.detect_common_spots(
+        [point.average for point in acquired],
+        expected_count=4,
+        min_peak_distance_px=8,
+        background_percentile=5,
+    )
+    rows, radius = scan_module.analyze_acquired_points(
+        acquired,
+        centers,
+        spot_radius_px=6,
+        background_percentile=5,
+    )
+    ranked_rows, best = scan_module.rank_quality(rows)
+
+    assert radius == pytest.approx(6)
+    np.testing.assert_allclose(centers, expected_centers, atol=1)
+    assert rows[0]["mean_fwhm_px"] < rows[1]["mean_fwhm_px"]
+    assert rows[0]["mean_encircled_energy_radius_50_px"] < rows[1][
+        "mean_encircled_energy_radius_50_px"
+    ]
+    assert rows[0]["target_plane_uniformity"] > rows[1][
+        "target_plane_uniformity"
+    ]
+    assert rows[0]["background_halo"] < rows[1]["background_halo"]
+    assert rows[0]["mean_spot_sharpness"] > rows[1][
+        "mean_spot_sharpness"
+    ]
+    assert ranked_rows[0]["quality_score"] > ranked_rows[1][
+        "quality_score"
+    ]
+    assert best["delta_z_mm"] == pytest.approx(0.0)
+
+
+def test_common_spot_detection_respects_camera_roi(scan_module):
+    image = np.zeros((60, 80), dtype=np.float64)
+    image[10, 10] = 1000
+    image[30, 40] = 100
+    image[30, 55] = 90
+
+    centers = scan_module.detect_common_spots(
+        [image],
+        expected_count=2,
+        roi_xywh=(30, 20, 35, 25),
+        min_peak_distance_px=5,
+        background_percentile=0,
+    )
+
+    np.testing.assert_array_equal(centers, np.array([[30, 40], [30, 55]]))
+
+
+def test_quality_ranking_excludes_saturated_scan_point(scan_module):
+    rows = [
+        {
+            "delta_z_mm": -5.0,
+            "target_plane_uniformity": 1.0,
+            "mean_spot_sharpness": 1.0,
+            "background_halo": 0.0,
+            "mean_fwhm_px": 1.0,
+            "saturation_fraction": 0.1,
+        },
+        {
+            "delta_z_mm": 0.0,
+            "target_plane_uniformity": 0.8,
+            "mean_spot_sharpness": 0.8,
+            "background_halo": 0.1,
+            "mean_fwhm_px": 2.0,
+            "saturation_fraction": 0.0,
+        },
+    ]
+
+    ranked, best = scan_module.rank_quality(
+        rows, maximum_saturation_fraction=0.001
+    )
+
+    assert ranked[0]["quality_score"] > ranked[1]["quality_score"]
+    assert ranked[0]["eligible_for_best"] is False
+    assert ranked[1]["eligible_for_best"] is True
+    assert best["delta_z_mm"] == pytest.approx(0.0)
+
+
+def test_quality_ranking_rejects_an_all_saturated_scan(scan_module):
+    row = {
+        "delta_z_mm": 0.0,
+        "target_plane_uniformity": 1.0,
+        "mean_spot_sharpness": 1.0,
+        "background_halo": 0.0,
+        "mean_fwhm_px": 1.0,
+        "saturation_fraction": 0.1,
+    }
+
+    with pytest.raises(ValueError, match="all scan points are saturated"):
+        scan_module.rank_quality([row], maximum_saturation_fraction=0.001)

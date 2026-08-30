@@ -4,7 +4,107 @@ import torch.fft as fft
 import matplotlib.pyplot as plt
 
 
-def WGS_phase_generate(initSLMAmp:torch.Tensor, initSLMPhase:torch.Tensor, targetAmp:torch.Tensor, Loop = 5, threshold = 0.01, Plot:bool = False):
+def _angular_spectrum_transfer_function(
+    shape: tuple[int, int],
+    distance_mm: float,
+    wavelength_um: float,
+    pixel_pitch_um: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if wavelength_um <= 0:
+        raise ValueError("wavelength_um must be positive")
+    if pixel_pitch_um <= 0:
+        raise ValueError("pixel_pitch_um must be positive")
+
+    height, width = shape
+    pitch_m = pixel_pitch_um * 1e-6
+    wavelength_m = wavelength_um * 1e-6
+    distance_m = distance_mm * 1e-3
+
+    fx = fft.fftfreq(width, d=pitch_m, device=device, dtype=dtype)
+    fy = fft.fftfreq(height, d=pitch_m, device=device, dtype=dtype)
+    fy_grid, fx_grid = torch.meshgrid(fy, fx, indexing="ij")
+    longitudinal_frequency_squared = (
+        1.0 / wavelength_m**2 - fx_grid**2 - fy_grid**2
+    )
+    propagating = longitudinal_frequency_squared >= 0
+    longitudinal_frequency = torch.sqrt(
+        torch.clamp(longitudinal_frequency_squared, min=0)
+    )
+    phase = 2 * torch.pi * distance_m * longitudinal_frequency
+    transfer = torch.exp(1j * phase)
+    return torch.where(propagating, transfer, torch.zeros_like(transfer))
+
+
+def _propagate_with_transfer(
+    field: torch.Tensor, transfer: torch.Tensor
+) -> torch.Tensor:
+    return fft.ifft2(fft.fft2(field) * transfer)
+
+
+def angular_spectrum_propagate(
+    field: torch.Tensor,
+    distance_mm: float,
+    wavelength_um: float,
+    pixel_pitch_um: float,
+):
+    """Propagate a sampled complex field with the angular-spectrum method.
+
+    Positive ``distance_mm`` propagates from the ideal 4f image plane toward
+    the actual objective pupil. Negative distances propagate in the opposite
+    direction. The last two tensor dimensions are interpreted as ``(y, x)``.
+    """
+    if distance_mm == 0:
+        return field
+    if field.ndim < 2:
+        raise ValueError("field must have at least two dimensions")
+    transfer = _angular_spectrum_transfer_function(
+        tuple(field.shape[-2:]),
+        distance_mm,
+        wavelength_um,
+        pixel_pitch_um,
+        device=field.device,
+        dtype=field.real.dtype,
+    )
+    return _propagate_with_transfer(field, transfer)
+
+
+def circular_pupil_mask(
+    shape: tuple[int, int],
+    pixel_pitch_um: float,
+    pupil_radius_mm: float,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a centered circular objective-pupil mask on an image-plane grid."""
+    if pupil_radius_mm <= 0:
+        raise ValueError("pupil_radius_mm must be positive")
+    height, width = shape
+    y = (
+        torch.arange(height, device=device, dtype=dtype) - height / 2
+    ) * pixel_pitch_um * 1e-3
+    x = (
+        torch.arange(width, device=device, dtype=dtype) - width / 2
+    ) * pixel_pitch_um * 1e-3
+    y_grid, x_grid = torch.meshgrid(y, x, indexing="ij")
+    return x_grid**2 + y_grid**2 <= pupil_radius_mm**2
+
+
+def WGS_phase_generate(
+    initSLMAmp: torch.Tensor,
+    initSLMPhase: torch.Tensor,
+    targetAmp: torch.Tensor,
+    Loop=5,
+    threshold=0.01,
+    Plot: bool = False,
+    delta_z_mm: float = 0.0,
+    wavelength_um: float = 0.795,
+    image_pixel_pitch_um: float = 12.5,
+    pupil_radius_mm: float | None = None,
+):
     '''
     This function uses WGS algorithm to generate hologram according to your input targetAmp.
     
@@ -28,6 +128,20 @@ def WGS_phase_generate(initSLMAmp:torch.Tensor, initSLMPhase:torch.Tensor, targe
         
     Plot : 
         Whether to plot non-uniformity vs iteration. Default to be False.
+
+    delta_z_mm :
+        Axial distance from the ideal 4f image plane to the actual objective
+        pupil, in mm. Zero preserves the original WGS propagation exactly.
+
+    wavelength_um :
+        Vacuum wavelength in um, used by the pupil-conjugation propagation.
+
+    image_pixel_pitch_um :
+        Sampling pitch at the ideal 4f image plane in um.
+
+    pupil_radius_mm :
+        Radius of the objective entrance pupil in mm. When omitted, no pupil
+        clipping is added, preserving legacy behavior for ``delta_z_mm=0``.
         
     '''
 
@@ -37,6 +151,27 @@ def WGS_phase_generate(initSLMAmp:torch.Tensor, initSLMPhase:torch.Tensor, targe
     initSLMAmp = initSLMAmp.to(device)
     initSLMPhase = initSLMPhase.to(device)
     targetAmp = targetAmp.to(device)
+
+    pupil_mask = None
+    if pupil_radius_mm is not None:
+        pupil_mask = circular_pupil_mask(
+            tuple(initSLMAmp.shape[-2:]),
+            image_pixel_pitch_um,
+            pupil_radius_mm,
+            device=device,
+            dtype=initSLMAmp.dtype,
+        )
+
+    forward_transfer = None
+    if delta_z_mm != 0:
+        forward_transfer = _angular_spectrum_transfer_function(
+            tuple(initSLMAmp.shape[-2:]),
+            delta_z_mm,
+            wavelength_um,
+            image_pixel_pitch_um,
+            device=device,
+            dtype=initSLMAmp.dtype,
+        )
 
     SLM_Field = torch.multiply(initSLMAmp, torch.exp(1j*initSLMPhase))
     targetAmp = targetAmp/torch.sqrt(torch.sum(torch.square(targetAmp)))
@@ -52,7 +187,13 @@ def WGS_phase_generate(initSLMAmp:torch.Tensor, initSLMPhase:torch.Tensor, targe
     targetAmp_weightfactor = torch.abs(targetAmp) / torch.sum(torch.abs(targetAmp))
 
     while count < Loop:
-        fftSLM = fft.fft2(SLM_Field)
+        if forward_transfer is None:
+            pupil_field = SLM_Field
+        else:
+            pupil_field = _propagate_with_transfer(SLM_Field, forward_transfer)
+        if pupil_mask is not None:
+            pupil_field = pupil_field * pupil_mask
+        fftSLM = fft.fft2(pupil_field)
         fftSLMShift = fft.fftshift(fftSLM)
         fftSLM_norm = torch.sqrt(torch.sum(torch.square(torch.abs(fftSLMShift))))
         fftSLMShift_norm = fftSLMShift / fftSLM_norm
@@ -79,8 +220,14 @@ def WGS_phase_generate(initSLMAmp:torch.Tensor, initSLMPhase:torch.Tensor, targe
         Focal_phase = Focal_phase0
         Focal_Field = torch.multiply(Focal_Amp, torch.exp(1j * Focal_phase))
 
-        SLM_Field = fft.ifft2(fft.ifftshift(Focal_Field))
-        SLM_Phase = torch.angle(SLM_Field)
+        image_plane_field = fft.ifft2(fft.ifftshift(Focal_Field))
+        if pupil_mask is not None:
+            image_plane_field = image_plane_field * pupil_mask
+        if forward_transfer is not None:
+            image_plane_field = _propagate_with_transfer(
+                image_plane_field, torch.conj(forward_transfer)
+            )
+        SLM_Phase = torch.angle(image_plane_field)
 
         SLM_Field = torch.multiply(initSLMAmp, torch.exp(1j * SLM_Phase))
         g_coeff0 = g_coeff
@@ -274,5 +421,3 @@ def slm_screen_correct(slm_screen, fresnel_lens_screen, slm_correction, LUT):
     slm_screen_f_corrected_LUT_cpu = slm_screen_f_corrected_LUT.clone().cpu().numpy()
 
     return slm_screen_f_corrected_LUT_cpu
-
-

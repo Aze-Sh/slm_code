@@ -8,3 +8,6 @@ __pycache__/
 
 253_31033_139-pycharm-support-libs/
 slm code/
+
+# Large offline scan products (phase grids, BMPs, metrics)
+delta_z_scan_outputs/

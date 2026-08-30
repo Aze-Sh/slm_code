@@ -1,0 +1,26 @@
+{
+    "pixelpitch": 12.5,
+    "SLMRes": [1272, 1024],
+    "arraySizeBit": [12, 12],
+
+    "Loop": 25,
+    "threshold": 0.01,
+    "beamwaist": 6240,
+    "focallength": 200000,
+    "magnification": 1,
+    "wavelength": 0.795,
+    "mask": false,
+    "maskradius": 5000,
+    "distance": [0,0],
+    "spacing": [150,150],
+    "arraysize": [8, 8],
+    "translate": false,
+    "rotate": false,
+    "angle": 0,
+    "modify": false,
+    "AddZernike": false,
+    "ind_Zernike_list": [3,4,5],
+    "percent_list": [-0.35,0.5,0.1],
+    "zernike_aperture_radius": 6000,
+    "isZernikePhaseContinous": false
+  }

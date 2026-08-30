@@ -1,0 +1,10 @@
+.venv312/
+.venv/
+venv/
+__pycache__/
+.ipynb_checkpoints/
+.idea/
+*.pyc
+
+253_31033_139-pycharm-support-libs/
+slm code/

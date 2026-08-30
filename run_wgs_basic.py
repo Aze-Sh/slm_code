@@ -11,7 +11,7 @@ SLM.image_init(Plot=True)
 
 targetAmp = SLM.target_generate(
     Lattice_type="Rec",
-    spacing=[150, 150],
+    spacing=[7.875, 7.875],
     arraysize=[3, 3],
     translate=False,
     rotate=False,

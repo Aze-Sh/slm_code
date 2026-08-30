@@ -93,6 +93,30 @@ def circular_pupil_mask(
     return x_grid**2 + y_grid**2 <= pupil_radius_mm**2
 
 
+def centered_rectangular_mask(
+    shape: tuple[int, int],
+    active_shape: tuple[int, int],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a centered rectangular active-area mask on a padded grid."""
+    height, width = shape
+    active_height, active_width = active_shape
+    if active_height <= 0 or active_width <= 0:
+        raise ValueError("active-area dimensions must be positive")
+    if active_height > height or active_width > width:
+        raise ValueError("active area must fit inside the calculation grid")
+    start_y = (height - active_height) // 2
+    start_x = (width - active_width) // 2
+    mask = torch.zeros((height, width), device=device, dtype=dtype)
+    mask[
+        start_y : start_y + active_height,
+        start_x : start_x + active_width,
+    ] = 1
+    return mask
+
+
 def WGS_phase_generate(
     initSLMAmp: torch.Tensor,
     initSLMPhase: torch.Tensor,
@@ -104,6 +128,7 @@ def WGS_phase_generate(
     wavelength_um: float = 0.795,
     image_pixel_pitch_um: float = 12.5,
     pupil_radius_mm: float | None = None,
+    slm_active_shape: tuple[int, int] | None = None,
 ):
     '''
     This function uses WGS algorithm to generate hologram according to your input targetAmp.
@@ -142,6 +167,10 @@ def WGS_phase_generate(
     pupil_radius_mm :
         Radius of the objective entrance pupil in mm. When omitted, no pupil
         clipping is added, preserving legacy behavior for ``delta_z_mm=0``.
+
+    slm_active_shape :
+        Physical SLM active area as ``(height, width)`` pixels on the padded
+        calculation grid. When omitted, the padded input field is unchanged.
         
     '''
 
@@ -161,6 +190,16 @@ def WGS_phase_generate(
             device=device,
             dtype=initSLMAmp.dtype,
         )
+
+    active_mask = None
+    if slm_active_shape is not None:
+        active_mask = centered_rectangular_mask(
+            tuple(initSLMAmp.shape[-2:]),
+            slm_active_shape,
+            device=device,
+            dtype=initSLMAmp.dtype,
+        )
+        initSLMAmp = initSLMAmp * active_mask
 
     forward_transfer = None
     if delta_z_mm != 0:

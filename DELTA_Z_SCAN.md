@@ -9,7 +9,9 @@ WGS，并输出之后可以逐张加载到 SLM 的 BMP。
 正向模型为：
 
 ```text
-理想 4f SLM 共轭场
+准直高斯输入场
+  -> 1272 x 1024 SLM active-area（外部振幅为零）
+  -> 理想 4f SLM 共轭场
   -> Angular Spectrum propagation(delta_z)
   -> Obj1 有限圆形 pupil
   -> Obj1 Fourier transform
@@ -38,9 +40,21 @@ python delta_z_scan.py --output-dir delta_z_scan_outputs
 ```
 
 参数默认来自 `hamamatsu_test_config.json`：波长 0.795 um、SLM 像素
-12.5 um、4f 放大率 1。pupil 半径默认读取 `maskradius=5000 um`，即 5 mm；
-这个 pupil 在扫描中始终启用，即使 `delta_z=0` 也启用，保证所有扫描点使用
-相同的物镜模型。
+12.5 um、4f 放大率 1。当前 Obj1 为 LD Plan 19X/0.65，焦距 10.5 mm；
+按 `f_obj * NA` 得到有效 pupil 半径 6.825 mm，因此默认读取
+`maskradius=6825 um`。资料中的 36 mm 是最大通光孔径，不作为有效 pupil
+直径使用。这个 pupil 在扫描中始终启用，即使 `delta_z=0` 也启用，保证所有
+扫描点使用相同的物镜模型。
+
+SLM 使用 Hamamatsu 的 1272 x 1024 有效 LCOS 像素，像素间距 12.5 um，
+有效面积 15.9 x 12.8 mm。控制器传输格式虽然是 1280 x 1024 SXGA，但额外
+的 8 列不是有效调制像素。扫描器在 4096 x 4096 padded grid 上对实际
+1272 x 1024 矩形以外的输入振幅置零，并将入射波前视为理想准直光。
+
+配置中的阵列间距为 7.875 um。这是把旧的 200 mm 聚焦模型下 150 um 间距
+按 `10.5 / 200` 缩放后的结果，因此 8 x 8 阵列在 WGS 计算网格中的位置保持
+为原来的 48 pixel 间距。若实验需要其他真实光镊间距，应直接修改配置中的
+`spacing`，单位为 Obj1 target/focal plane 上的 um。
 
 可以显式修改 pupil 半径：
 
@@ -70,14 +84,23 @@ python delta_z_scan.py --delta-z-mm -2 -1 0 1 2
 
 每个扫描点生成：
 
-- `slm_phase_delta_z_*.npy`：完整计算网格上的相位，单位 rad；
-- `slm_phase_delta_z_*.bmp`：沿用现有 `phase_to_screen` 的中心裁剪和 8-bit 编码；
+- `slm_phase_scan_###_delta_z_*.npy`：完整计算网格上的相位，单位 rad；
+- `slm_phase_scan_###_delta_z_*.bmp`：完整 1272 x 1024 LCOS 区域的 8-bit
+  相位图；
 - `delta_z_metrics.csv`：仿真指标；
 - `metrics_vs_delta_z.png`：指标曲线；
-- `scan_parameters.json`：本次扫描参数和随机种子。
+- `scan_parameters.json`：本次扫描的物镜、pupil、SLM、目标阵列、计算网格、
+  输入波前模型、BMP 校准状态和随机种子。
 
 BMP 是原始 WGS phase screen；扫描器不会额外叠加 Blink calibration、Zernike
 或薄透镜二次相位，因而粗扫中唯一变化的建模参数是 `delta_z`。
+`scan_000`、`scan_001` 等前缀保证 USB_SLMControl 按文件名升序批量写入
+frame memory 时，slot 顺序与命令行给出的 `delta_z` 顺序一致。默认粗扫即为
+`-20, -15, ..., +20 mm`。
+
+每次扫描必须使用新的输出目录。如果目录中已经存在本扫描器生成的 BMP、NPY、
+CSV、PNG 或参数 JSON，程序会在计算前报错，避免旧 BMP 混入 USB frame
+memory。程序不会自动删除或覆盖这些实验文件。
 
 CSV 指标定义：
 
@@ -116,7 +139,9 @@ phase = WGS_phase_generate(
     target_amp,
     delta_z_mm=0.0,
     pupil_radius_mm=None,
+    slm_active_shape=None,
 )
 ```
 
-物理 `delta_z` 扫描应显式提供 `pupil_radius_mm`；命令行扫描器默认提供 5 mm。
+物理 `delta_z` 扫描应显式提供 `pupil_radius_mm`；命令行扫描器当前根据
+LD Plan 19X/0.65 配置默认提供 6.825 mm。

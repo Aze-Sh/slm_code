@@ -25,6 +25,8 @@ class SLM_class():  #用于生成输入输出振幅分布
         self.threshold = data['threshold']  # 相位固定阈值
 
         self.beamwaist = data['beamwaist']  # 入射高斯光束腰，单位um
+        self.objective_model = data.get('objective_model', 'unspecified')
+        self.objective_na = data.get('objective_na')
         self.focallength = data['focallength']  # 物镜焦距，单位um
         self.magnification = data['magnification']  # SLM到物镜间的成像系统的放大率
         self.wavelength = data['wavelength']  # 光波长，单位um
@@ -675,4 +677,3 @@ class SLM_class():  #用于生成输入输出振幅分布
 
 
  
-

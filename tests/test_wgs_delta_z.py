@@ -87,6 +87,43 @@ def test_zero_delta_z_is_exactly_the_legacy_wgs_path():
     torch.testing.assert_close(actual.cpu(), expected, rtol=0.0, atol=0.0)
 
 
+def test_slm_active_area_is_a_centered_rectangle_used_by_wgs():
+    """Catches padded-grid light leaking outside the physical LCOS pixels."""
+    active_shape = (4, 6)
+    mask = WGS.centered_rectangular_mask(
+        (8, 10),
+        active_shape,
+        device=torch.device("cpu"),
+        dtype=torch.float64,
+    )
+    expected_mask = torch.zeros((8, 10), dtype=torch.float64)
+    expected_mask[2:6, 2:8] = 1.0
+    torch.testing.assert_close(mask, expected_mask)
+
+    generator = torch.Generator().manual_seed(51)
+    init_amplitude = torch.rand((8, 10), generator=generator, dtype=torch.float64)
+    init_phase = torch.rand((8, 10), generator=generator, dtype=torch.float64)
+    target_amplitude = torch.zeros((8, 10), dtype=torch.float64)
+    target_amplitude[2, 3] = 1.0
+    target_amplitude[5, 7] = 1.0
+
+    expected_phase = WGS_phase_generate(
+        init_amplitude * expected_mask,
+        init_phase,
+        target_amplitude,
+        Loop=2,
+    )
+    actual_phase = WGS_phase_generate(
+        init_amplitude,
+        init_phase,
+        target_amplitude,
+        Loop=2,
+        slm_active_shape=active_shape,
+    )
+
+    torch.testing.assert_close(actual_phase, expected_phase)
+
+
 @pytest.mark.parametrize("distance_mm", [-3.0, 3.0])
 def test_angular_spectrum_propagates_a_plane_wave_with_the_correct_sign(
     distance_mm,

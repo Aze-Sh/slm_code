@@ -7,7 +7,7 @@ import csv
 import json
 import os
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import matplotlib
 
@@ -18,10 +18,24 @@ import torch
 import torch.nn.functional as torch_functional
 from PIL import Image
 
-from WGS import WGS_phase_generate, angular_spectrum_propagate, circular_pupil_mask
+from WGS import (
+    WGS_phase_generate,
+    angular_spectrum_propagate,
+    centered_rectangular_mask,
+    circular_pupil_mask,
+)
 
 
 COARSE_DELTA_Z_MM = (-20.0, -15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0)
+SCAN_OUTPUT_PATTERNS = (
+    "slm_phase_scan_*.npy",
+    "slm_phase_scan_*.bmp",
+    "slm_phase_delta_z_*.npy",
+    "slm_phase_delta_z_*.bmp",
+    "delta_z_metrics.csv",
+    "metrics_vs_delta_z.png",
+    "scan_parameters.json",
+)
 
 
 def _delta_z_label(delta_z_mm: float) -> str:
@@ -29,30 +43,50 @@ def _delta_z_label(delta_z_mm: float) -> str:
     return f"delta_z_{sign}{abs(delta_z_mm):07.3f}mm"
 
 
+def _indexed_delta_z_label(
+    scan_index: int, scan_count: int, delta_z_mm: float
+) -> str:
+    if scan_count <= 0 or scan_index < 0 or scan_index >= scan_count:
+        raise ValueError("scan index must be inside a non-empty scan")
+    index_width = max(3, len(str(scan_count - 1)))
+    return (
+        f"scan_{scan_index:0{index_width}d}_{_delta_z_label(delta_z_mm)}"
+    )
+
+
+def _prepare_output_directory(output_path: Path) -> None:
+    if output_path.exists() and not output_path.is_dir():
+        raise NotADirectoryError(f"output path is not a directory: {output_path}")
+    conflicts = []
+    if output_path.exists():
+        for pattern in SCAN_OUTPUT_PATTERNS:
+            conflicts.extend(output_path.glob(pattern))
+    if conflicts:
+        names = ", ".join(sorted(path.name for path in conflicts)[:5])
+        raise FileExistsError(
+            "delta-z scan outputs already exist; choose a fresh output directory "
+            f"to avoid mixing frame-memory slots ({names})"
+        )
+    output_path.mkdir(parents=True, exist_ok=True)
+
+
 def _phase_to_screen(
     phase: np.ndarray, slm_resolution: tuple[int, int]
 ) -> np.ndarray:
-    """Match the repository's existing centered crop and 8-bit encoding."""
+    """Crop the full physical LCOS rectangle and apply 8-bit phase encoding."""
     slm_width, slm_height = slm_resolution
-    crop_size = min(slm_width, slm_height)
     height, width = phase.shape
-    start_y = int(height / 2 - round(crop_size / 2))
-    start_x = int(width / 2 - round(crop_size / 2))
+    if slm_height > height or slm_width > width:
+        raise ValueError("SLM resolution must fit inside the phase grid")
+    start_y = (height - slm_height) // 2
+    start_x = (width - slm_width) // 2
     cropped = phase[
-        start_y : start_y + crop_size,
-        start_x : start_x + crop_size,
+        start_y : start_y + slm_height,
+        start_x : start_x + slm_width,
     ]
-    encoded = np.around((cropped + np.pi) / (2 * np.pi) * 256).astype(
+    return np.around((cropped + np.pi) / (2 * np.pi) * 256).astype(
         np.uint8
     )
-    screen = np.zeros((slm_height, slm_width), dtype=np.uint8)
-    screen_start_y = int(slm_height / 2 - round(crop_size / 2))
-    screen_start_x = int(slm_width / 2 - round(crop_size / 2))
-    screen[
-        screen_start_y : screen_start_y + crop_size,
-        screen_start_x : screen_start_x + crop_size,
-    ] = encoded
-    return screen
 
 
 def _simulate_intensity(
@@ -63,9 +97,19 @@ def _simulate_intensity(
     wavelength_um: float,
     image_pixel_pitch_um: float,
     pupil_radius_mm: float,
+    slm_active_shape: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     device = phase.device
     amplitude = init_amplitude.to(device)
+    input_power = torch.sum(torch.square(torch.abs(amplitude)))
+    if slm_active_shape is not None:
+        active_mask = centered_rectangular_mask(
+            tuple(amplitude.shape[-2:]),
+            slm_active_shape,
+            device=device,
+            dtype=amplitude.dtype,
+        )
+        amplitude = amplitude * active_mask
     image_field = amplitude * torch.exp(1j * phase)
     if delta_z_mm == 0:
         pupil_field = image_field
@@ -86,7 +130,6 @@ def _simulate_intensity(
     pupil_field = pupil_field * pupil_mask
     target_field = torch.fft.fftshift(torch.fft.fft2(pupil_field))
     intensity = torch.abs(target_field) ** 2
-    input_power = torch.sum(torch.square(torch.abs(image_field)))
     sample_count = image_field.shape[-2] * image_field.shape[-1]
     return intensity / (sample_count * input_power)
 
@@ -189,6 +232,7 @@ def run_delta_z_scan(
     image_pixel_pitch_um: float,
     pupil_radius_mm: float,
     slm_resolution: tuple[int, int],
+    slm_active_shape: tuple[int, int] | None = None,
     halo_exclusion_radius_px: int = 3,
 ) -> list[dict[str, float | str]]:
     """Run an independent WGS optimization and save outputs for every delta_z."""
@@ -200,11 +244,13 @@ def run_delta_z_scan(
         raise ValueError("delta_z values produce duplicate output labels")
 
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
+    _prepare_output_directory(output_path)
     rows: list[dict[str, float | str]] = []
 
-    for delta_z_mm in delta_z_values:
-        label = _delta_z_label(delta_z_mm)
+    for scan_index, delta_z_mm in enumerate(delta_z_values):
+        scan_label = _indexed_delta_z_label(
+            scan_index, len(delta_z_values), delta_z_mm
+        )
         phase = WGS_phase_generate(
             init_amplitude.clone(),
             init_phase.clone(),
@@ -216,10 +262,11 @@ def run_delta_z_scan(
             wavelength_um=wavelength_um,
             image_pixel_pitch_um=image_pixel_pitch_um,
             pupil_radius_mm=pupil_radius_mm,
+            slm_active_shape=slm_active_shape,
         )
         phase_cpu = phase.detach().cpu().numpy()
-        phase_filename = f"slm_phase_{label}.npy"
-        bitmap_filename = f"slm_phase_{label}.bmp"
+        phase_filename = f"slm_phase_{scan_label}.npy"
+        bitmap_filename = f"slm_phase_{scan_label}.bmp"
         np.save(output_path / phase_filename, phase_cpu)
         screen = _phase_to_screen(phase_cpu, slm_resolution)
         Image.fromarray(screen, mode="L").save(output_path / bitmap_filename)
@@ -231,6 +278,7 @@ def run_delta_z_scan(
             wavelength_um=wavelength_um,
             image_pixel_pitch_um=image_pixel_pitch_um,
             pupil_radius_mm=pupil_radius_mm,
+            slm_active_shape=slm_active_shape,
         )
         metrics = _calculate_metrics(
             intensity, target_amplitude, halo_exclusion_radius_px
@@ -283,6 +331,36 @@ def build_delta_z_values(
         raise ValueError("stop_mm must be >= start_mm")
     values = np.arange(start_mm, stop_mm + step_mm * 0.5, step_mm)
     return [float(value) for value in values if value <= stop_mm + 1e-9]
+
+
+def _build_scan_parameters(
+    *,
+    slm: Any,
+    delta_z_values_mm: list[float],
+    loops: int,
+    threshold: float,
+    pupil_radius_mm: float,
+    seed: int,
+) -> dict[str, object]:
+    return {
+        "delta_z_values_mm": delta_z_values_mm,
+        "loops": loops,
+        "threshold": threshold,
+        "wavelength_um": slm.wavelength,
+        "image_pixel_pitch_um": slm.pixelpitch * abs(slm.magnification),
+        "pupil_radius_mm": pupil_radius_mm,
+        "objective_model": slm.objective_model,
+        "objective_na": slm.objective_na,
+        "objective_focal_length_um": slm.focallength,
+        "target_spacing_um": list(slm.spacing),
+        "target_array_size": list(slm.arraysize),
+        "calculation_grid_shape_yx": [slm.ImgResY, slm.ImgResX],
+        "slm_resolution_xy": list(slm.SLMRes),
+        "slm_active_shape_yx": [slm.SLMRes[1], slm.SLMRes[0]],
+        "input_wavefront_model": "collimated",
+        "bmp_calibration_applied": False,
+        "seed": seed,
+    }
 
 
 def _parse_args() -> argparse.Namespace:
@@ -347,17 +425,17 @@ def main() -> None:
         image_pixel_pitch_um=image_pixel_pitch_um,
         pupil_radius_mm=pupil_radius_mm,
         slm_resolution=tuple(slm.SLMRes),
+        slm_active_shape=(slm.SLMRes[1], slm.SLMRes[0]),
         halo_exclusion_radius_px=args.halo_exclusion_radius_px,
     )
-    parameters = {
-        "delta_z_values_mm": delta_z_values,
-        "loops": loops,
-        "threshold": threshold,
-        "wavelength_um": slm.wavelength,
-        "image_pixel_pitch_um": image_pixel_pitch_um,
-        "pupil_radius_mm": pupil_radius_mm,
-        "seed": args.seed,
-    }
+    parameters = _build_scan_parameters(
+        slm=slm,
+        delta_z_values_mm=delta_z_values,
+        loops=loops,
+        threshold=threshold,
+        pupil_radius_mm=pupil_radius_mm,
+        seed=args.seed,
+    )
     (output_dir / "scan_parameters.json").write_text(
         json.dumps(parameters, indent=2), encoding="utf-8"
     )

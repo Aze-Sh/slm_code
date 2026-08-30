@@ -7,9 +7,13 @@ and CCD data can be analyzed on a computer without wxPython or Vimba X.
 
 from __future__ import annotations
 
+import argparse
 import csv
+import json
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -602,3 +606,383 @@ def rank_quality(
     eligible_scores = np.where(eligible_array, quality_scores, -np.inf)
     best_index = int(np.argmax(eligible_scores))
     return ranked_rows, ranked_rows[best_index]
+
+
+def _write_experimental_metrics(
+    rows: list[dict[str, float | str | bool]], output_path: Path
+) -> None:
+    csv_path = output_path / "experimental_metrics.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_experimental_plot(
+    rows: list[dict[str, float | str | bool]], path: Path
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    delta_z = np.asarray([float(row["delta_z_mm"]) for row in rows])
+    series = (
+        ("quality_score", "Experimental quality score"),
+        ("target_plane_uniformity", "Spot uniformity (min/max)"),
+        ("mean_fwhm_px", "Mean equivalent FWHM (px)"),
+        ("background_halo", "Background / halo fraction"),
+        ("mean_spot_sharpness", "Mean spot sharpness"),
+        ("saturation_fraction", "Saturated pixel fraction"),
+    )
+    figure, axes = plt.subplots(3, 2, figsize=(10, 11), sharex=True)
+    for axis, (key, title) in zip(axes.flat, series):
+        axis.plot(delta_z, [float(row[key]) for row in rows], "o-")
+        axis.set_title(title)
+        axis.grid(True, alpha=0.3)
+    for axis in axes[-1]:
+        axis.set_xlabel("delta_z (mm)")
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
+def _write_spot_overlay(
+    acquired: list[AcquiredPoint],
+    centers: np.ndarray,
+    radius: float,
+    path: Path,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+
+    normalized_images = []
+    for result in acquired:
+        image = np.asarray(result.average, dtype=np.float64)
+        scale = float(np.max(image))
+        normalized_images.append(image / scale if scale > 0 else image)
+    reference = np.mean(normalized_images, axis=0)
+
+    figure, axis = plt.subplots(figsize=(8, 7))
+    image_handle = axis.imshow(reference, cmap="gray")
+    for index, (center_y, center_x) in enumerate(centers):
+        axis.add_patch(
+            Circle(
+                (center_x, center_y),
+                radius,
+                fill=False,
+                edgecolor="tab:red",
+                linewidth=0.8,
+            )
+        )
+        axis.text(
+            center_x,
+            center_y,
+            str(index),
+            color="yellow",
+            fontsize=6,
+            ha="center",
+            va="center",
+        )
+    axis.set_title("Common CCD spot ROIs used for every delta_z")
+    figure.colorbar(image_handle, ax=axis, shrink=0.8)
+    figure.tight_layout()
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+
+
+def _load_source_scan_parameters(scan_directory: Path) -> dict[str, object] | None:
+    parameters_path = scan_directory / "scan_parameters.json"
+    if not parameters_path.is_file():
+        return None
+    with parameters_path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def run_experimental_scan(
+    points: list[ScanPoint],
+    display,
+    camera,
+    output_dir: str | Path,
+    *,
+    exposure_us: float,
+    frames_per_point: int,
+    settle_seconds: float,
+    correction: np.ndarray | None,
+    correction_name: str | None,
+    lut: int,
+    save_raw_frames: bool,
+    saturation_level: float | None,
+    expected_spots: int,
+    roi_xywh: tuple[int, int, int, int] | None,
+    min_peak_distance_px: int,
+    spot_radius_px: float | None,
+    background_percentile: float,
+    maximum_saturation_fraction: float,
+    monitor_index: int,
+    camera_index: int,
+    sleep_fn=time.sleep,
+) -> tuple[
+    list[dict[str, float | str | bool]], dict[str, float | str | bool]
+]:
+    """Run acquisition, fixed-ROI analysis, ranking, and output generation."""
+    if not points:
+        raise ValueError("at least one scan point is required")
+    display_size_xy = tuple(int(value) for value in display.getSize())
+    with Image.open(points[0].bmp_path) as first_bitmap:
+        active_size_xy = tuple(int(value) for value in first_bitmap.size)
+
+    acquired = acquire_scan_points(
+        points,
+        display,
+        camera,
+        output_dir,
+        exposure_us=exposure_us,
+        frames_per_point=frames_per_point,
+        settle_seconds=settle_seconds,
+        correction=correction,
+        lut=lut,
+        save_raw_frames=save_raw_frames,
+        saturation_level=saturation_level,
+        sleep_fn=sleep_fn,
+    )
+    centers = detect_common_spots(
+        [result.average for result in acquired],
+        expected_spots,
+        roi_xywh=roi_xywh,
+        min_peak_distance_px=min_peak_distance_px,
+        background_percentile=background_percentile,
+    )
+    metric_rows, resolved_spot_radius = analyze_acquired_points(
+        acquired,
+        centers,
+        spot_radius_px=spot_radius_px,
+        roi_xywh=roi_xywh,
+        background_percentile=background_percentile,
+    )
+    ranked_rows, best = rank_quality(
+        metric_rows,
+        maximum_saturation_fraction=maximum_saturation_fraction,
+    )
+
+    output_path = Path(output_dir)
+    _write_experimental_metrics(ranked_rows, output_path)
+    _write_experimental_plot(
+        ranked_rows, output_path / "experimental_metrics_vs_delta_z.png"
+    )
+    _write_spot_overlay(
+        acquired,
+        centers,
+        resolved_spot_radius,
+        output_path / "detected_spots.png",
+    )
+    best_payload = {
+        "delta_z_mm": float(best["delta_z_mm"]),
+        "scan_label": str(best["scan_label"]),
+        "quality_score": float(best["quality_score"]),
+        "selection": (
+            "Highest equal-weight scan-normalized score from uniformity, "
+            "spot sharpness, inverse halo, and inverse FWHM among "
+            "unsaturated points."
+        ),
+    }
+    (output_path / "best_delta_z.json").write_text(
+        json.dumps(best_payload, indent=2), encoding="utf-8"
+    )
+
+    scan_directory = points[0].bmp_path.parent
+    parameters = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "source_scan_directory": str(scan_directory.resolve()),
+        "source_scan_parameters": _load_source_scan_parameters(scan_directory),
+        "scan_count": len(points),
+        "mechanics_during_scan": "fixed",
+        "slm_connection": "Windows secondary monitor via slmpy",
+        "monitor_index": monitor_index,
+        "display_transport_shape_xy": list(display_size_xy),
+        "slm_active_shape_xy": list(active_size_xy),
+        "slm_interpolation_applied": False,
+        "correction_bmp": correction_name,
+        "lut": lut,
+        "camera_backend": "Allied Vision Vimba X / vmbpy",
+        "camera_index": camera_index,
+        "exposure_us": exposure_us,
+        "frames_per_point": frames_per_point,
+        "settle_seconds": settle_seconds,
+        "save_raw_frames": save_raw_frames,
+        "saturation_level": saturation_level,
+        "maximum_saturation_fraction": maximum_saturation_fraction,
+        "camera_roi_xywh": list(roi_xywh) if roi_xywh is not None else None,
+        "expected_spots": expected_spots,
+        "min_peak_distance_px": min_peak_distance_px,
+        "spot_radius_px": resolved_spot_radius,
+        "background_percentile": background_percentile,
+        "detected_spot_centers_yx": centers.tolist(),
+        "quality_score_components": [
+            "target_plane_uniformity",
+            "mean_spot_sharpness",
+            "inverse_background_halo",
+            "inverse_mean_fwhm_px",
+        ],
+    }
+    (output_path / "experimental_parameters.json").write_text(
+        json.dumps(parameters, indent=2), encoding="utf-8"
+    )
+    return ranked_rows, best
+
+
+class SecondaryMonitorSLM:
+    """Lazy wrapper around the repository's wxPython secondary-monitor SLM."""
+
+    def __init__(self, monitor_index: int):
+        try:
+            import slmpy
+        except ImportError as error:
+            raise RuntimeError(
+                "wxPython/slmpy is unavailable; install wxPython on the "
+                "Windows experiment computer"
+            ) from error
+        self._display = slmpy.SLMdisplay(
+            monitor=monitor_index, isImageLock=True
+        )
+
+    def getSize(self):
+        return self._display.getSize()
+
+    def updateArray(self, frame):
+        return self._display.updateArray(frame)
+
+    def close(self):
+        self._display.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Display an independently optimized delta-z scan on a secondary-"
+            "monitor SLM, acquire Allied Vision frames, and rank real image "
+            "quality."
+        )
+    )
+    parser.add_argument("--scan-dir", default="delta_z_scan_outputs")
+    parser.add_argument("--output-dir", default="delta_z_experiment")
+    parser.add_argument("--monitor", type=int, default=1)
+    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--exposure-us", type=float, default=50.0)
+    parser.add_argument("--frames-per-point", type=int, default=16)
+    parser.add_argument("--settle-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--correction-bmp", default="CAL_LSH0804730_785nm.bmp"
+    )
+    parser.add_argument("--lut", type=int, default=224)
+    parser.add_argument("--no-calibration", action="store_true")
+    parser.add_argument("--save-raw-frames", action="store_true")
+    parser.add_argument("--saturation-level", type=float)
+    parser.add_argument("--expected-spots", type=int)
+    parser.add_argument(
+        "--roi",
+        type=int,
+        nargs=4,
+        metavar=("X", "Y", "WIDTH", "HEIGHT"),
+        help="Restrict detection and metrics to a fixed CCD ROI.",
+    )
+    parser.add_argument("--min-peak-distance-px", type=int, default=8)
+    parser.add_argument("--spot-radius-px", type=float)
+    parser.add_argument("--background-percentile", type=float, default=10.0)
+    parser.add_argument(
+        "--maximum-saturation-fraction", type=float, default=0.001
+    )
+    return parser
+
+
+def _resolve_correction_path(filename: str) -> Path:
+    requested = Path(filename)
+    candidates = [requested]
+    if not requested.is_absolute():
+        candidates.append(Path(__file__).resolve().parent / requested)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(f"SLM correction BMP not found: {filename}")
+
+
+def _expected_spots_from_scan(
+    scan_directory: Path, explicit_expected_spots: int | None
+) -> int:
+    if explicit_expected_spots is not None:
+        if explicit_expected_spots <= 0:
+            raise ValueError("expected_spots must be positive")
+        return explicit_expected_spots
+    parameters = _load_source_scan_parameters(scan_directory)
+    if parameters is None or "target_array_size" not in parameters:
+        raise ValueError(
+            "expected spot count is unavailable; pass --expected-spots"
+        )
+    array_size = parameters["target_array_size"]
+    if not isinstance(array_size, list) or len(array_size) != 2:
+        raise ValueError("target_array_size in scan_parameters.json is invalid")
+    expected_spots = int(array_size[0]) * int(array_size[1])
+    if expected_spots <= 0:
+        raise ValueError("target_array_size must contain positive values")
+    return expected_spots
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    points = load_scan_points(args.scan_dir)
+    scan_directory = Path(args.scan_dir)
+    expected_spots = _expected_spots_from_scan(
+        scan_directory, args.expected_spots
+    )
+
+    correction = None
+    correction_name = None
+    if not args.no_calibration:
+        correction_path = _resolve_correction_path(args.correction_bmp)
+        with Image.open(correction_path) as correction_bitmap:
+            correction = np.asarray(
+                correction_bitmap.convert("L"), dtype=np.uint8
+            )
+        correction_name = str(correction_path)
+
+    from avt import VimbaCamera
+
+    with ExitStack() as stack:
+        display = SecondaryMonitorSLM(args.monitor)
+        stack.callback(display.close)
+        camera = VimbaCamera(cam_index=args.camera_index)
+        stack.callback(camera.close)
+        _, best = run_experimental_scan(
+            points,
+            display,
+            camera,
+            args.output_dir,
+            exposure_us=args.exposure_us,
+            frames_per_point=args.frames_per_point,
+            settle_seconds=args.settle_seconds,
+            correction=correction,
+            correction_name=correction_name,
+            lut=args.lut,
+            save_raw_frames=args.save_raw_frames,
+            saturation_level=args.saturation_level,
+            expected_spots=expected_spots,
+            roi_xywh=tuple(args.roi) if args.roi is not None else None,
+            min_peak_distance_px=args.min_peak_distance_px,
+            spot_radius_px=args.spot_radius_px,
+            background_percentile=args.background_percentile,
+            maximum_saturation_fraction=args.maximum_saturation_fraction,
+            monitor_index=args.monitor,
+            camera_index=args.camera_index,
+        )
+    print(
+        "Best measured delta_z: "
+        f"{float(best['delta_z_mm']):+.3f} mm "
+        f"(quality score {float(best['quality_score']):.4f})"
+    )
+
+
+if __name__ == "__main__":
+    main()

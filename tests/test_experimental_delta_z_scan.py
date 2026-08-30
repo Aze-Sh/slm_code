@@ -1,5 +1,7 @@
 import csv
 import importlib
+import json
+import sys
 
 import numpy as np
 import pytest
@@ -415,3 +417,120 @@ def test_quality_ranking_rejects_an_all_saturated_scan(scan_module):
 
     with pytest.raises(ValueError, match="all scan points are saturated"):
         scan_module.rank_quality([row], maximum_saturation_fraction=0.001)
+
+
+def test_cli_defaults_match_the_working_vimba_notebook(scan_module):
+    assert "wx" not in sys.modules
+    assert "vmbpy" not in sys.modules
+
+    args = scan_module.build_parser().parse_args([])
+
+    assert args.scan_dir == "delta_z_scan_outputs"
+    assert args.output_dir == "delta_z_experiment"
+    assert args.monitor == 1
+    assert args.camera_index == 0
+    assert args.exposure_us == pytest.approx(50)
+    assert args.frames_per_point == 16
+    assert args.settle_seconds == pytest.approx(1)
+    assert args.correction_bmp == "CAL_LSH0804730_785nm.bmp"
+    assert args.lut == 224
+    assert args.no_calibration is False
+    assert args.save_raw_frames is False
+    assert "wx" not in sys.modules
+    assert "vmbpy" not in sys.modules
+
+
+def test_cli_parses_analysis_and_raw_frame_options(scan_module):
+    args = scan_module.build_parser().parse_args(
+        [
+            "--no-calibration",
+            "--save-raw-frames",
+            "--roi",
+            "100",
+            "200",
+            "800",
+            "600",
+            "--expected-spots",
+            "64",
+            "--min-peak-distance-px",
+            "12",
+            "--spot-radius-px",
+            "8.5",
+            "--saturation-level",
+            "255",
+        ]
+    )
+
+    assert args.no_calibration is True
+    assert args.save_raw_frames is True
+    assert args.roi == [100, 200, 800, 600]
+    assert args.expected_spots == 64
+    assert args.min_peak_distance_px == 12
+    assert args.spot_radius_px == pytest.approx(8.5)
+    assert args.saturation_level == pytest.approx(255)
+
+
+def test_full_experimental_scan_writes_metrics_plots_and_best_delta_z(
+    scan_module, tmp_path
+):
+    points = _make_scan_points(scan_module, tmp_path)
+    centers = np.array([[20, 20], [20, 44], [44, 20], [44, 44]])
+    sharp = _gaussian_grid(
+        (64, 64), centers, sigma=1.2, amplitudes=[100] * 4
+    )
+    blurred = _gaussian_grid(
+        (64, 64), centers, sigma=3.2, amplitudes=[100, 80, 60, 40]
+    )
+    output_dir = tmp_path / "experiment"
+
+    rows, best = scan_module.run_experimental_scan(
+        points,
+        FakeDisplay((8, 4)),
+        FakeCamera([sharp, blurred]),
+        output_dir,
+        exposure_us=50,
+        frames_per_point=1,
+        settle_seconds=0,
+        correction=None,
+        correction_name=None,
+        lut=256,
+        save_raw_frames=False,
+        saturation_level=None,
+        expected_spots=4,
+        roi_xywh=None,
+        min_peak_distance_px=8,
+        spot_radius_px=6,
+        background_percentile=5,
+        maximum_saturation_fraction=0.001,
+        monitor_index=1,
+        camera_index=0,
+        sleep_fn=lambda _: None,
+    )
+
+    assert len(rows) == 2
+    assert best["delta_z_mm"] == pytest.approx(-5.0)
+    expected_outputs = {
+        "experimental_metrics.csv",
+        "experimental_metrics_vs_delta_z.png",
+        "detected_spots.png",
+        "best_delta_z.json",
+        "experimental_parameters.json",
+    }
+    assert expected_outputs <= {path.name for path in output_dir.iterdir()}
+    with (output_dir / "best_delta_z.json").open(encoding="utf-8") as handle:
+        saved_best = json.load(handle)
+    assert saved_best["delta_z_mm"] == pytest.approx(-5.0)
+    with (output_dir / "experimental_metrics.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        saved_rows = list(csv.DictReader(handle))
+    assert len(saved_rows) == 2
+    assert "quality_score" in saved_rows[0]
+    with (output_dir / "experimental_parameters.json").open(
+        encoding="utf-8"
+    ) as handle:
+        parameters = json.load(handle)
+    assert parameters["display_transport_shape_xy"] == [8, 4]
+    assert parameters["slm_active_shape_xy"] == [6, 4]
+    assert parameters["exposure_us"] == pytest.approx(50)
+    assert parameters["frames_per_point"] == 1

@@ -64,7 +64,7 @@ python -m pip install "C:\path\to\vmbpy-X.Y.Z-py-none-any.whl[numpy]"
 检查软件接口：
 
 ```powershell
-python -c "import wx; from vmbpy import VmbSystem; print(wx.version()); print(VmbSystem.get_version())"
+python -c "import importlib.metadata as m; import wx, vmbpy; print(wx.version()); print(m.version('VmbPy'))"
 python experimental_delta_z_scan.py --help
 ```
 
@@ -113,6 +113,11 @@ python experimental_delta_z_scan.py `
 ```text
 加载 phase → 等待 SLM/光路稳定 → AVT 连拍 → 帧平均 → 下一 delta_z
 ```
+
+终端会显示 `[acquire i/9]`、`[detect i/9]`、`[analyze i/9]` 和
+`[preview i/9]` 进度。平均帧采用逐帧 `float32` 累加，分析采用内存映射、先裁
+CCD ROI、再逐光斑小窗口计算；不会再同时创建 9 张 `float64` 副本、64 张全图
+mask 或两张全图坐标矩阵。
 
 默认显示前会应用：
 
@@ -179,8 +184,11 @@ SLM 序列号不是 `LSH0804730`，不要使用这张 correction，应换成当�
 
 `delta_z_experiment` 中包含：
 
-- `camera_average_<scan label>.npy`：浮点平均图；
-- `camera_average_<scan label>.tiff`：16-bit 可查看平均图；
+- `camera_average_<scan label>.npy`：`float32` 科学计算平均图；
+- `camera_average_<scan label>.tiff`：保持相机有效位深的平均图（Mono8 会保存为
+  8-bit，不会再因写入 16-bit 容器而显示成黑图）；
+- `camera_preview_<scan label>.png`：整轮使用同一灰度范围的 8-bit 预览；
+- `camera_stats_<scan label>.json`：每拍完一个点立即保存的峰值和逐帧过曝统计；
 - `camera_raw_<scan label>.npy`：可选原始帧；
 - `experimental_metrics.csv`：所有实拍指标；
 - `experimental_metrics_vs_delta_z.png`：实拍指标曲线；
@@ -203,6 +211,32 @@ SLM 序列号不是 `LSH0804730`，不要使用这张 correction，应换成当�
 `quality_score` 对以下四项做本轮扫描内的归一化并等权平均：均匀性、sharpness、
 反向 halo、反向 FWHM。它用于快速排序；最终选择时仍应同时查看原始 CCD 图、
 `detected_spots.png` 和各条独立指标。过曝点不会被自动推荐。
+
+### 已拍完 9 张但分析卡住或电脑重启
+
+只要实验目录中的 9 个 `camera_average_*.npy` 都存在，就不需要再次连接或操作
+SLM/CCD，也不需要重新拍摄。对你当前的 `4024×3036` 图，先运行：
+
+```powershell
+.\.venv\Scripts\python.exe .\experimental_delta_z_scan.py `
+  --scan-dir .\delta_z_scan_outputs `
+  --analyze-existing .\delta_z_experiment_test `
+  --roi 900 800 1400 1400 `
+  --expected-spots 64 `
+  --min-peak-distance-px 25 `
+  --spot-radius-px 15 `
+  --saturation-level 255
+```
+
+这个 ROI 覆盖了当前上传图中的 8×8 阵列，同时显著减少内存和运算量。程序只
+读取 NPY，在原实验目录中补写 CSV、曲线、`detected_spots.png`、9 张可查看的
+PNG 和 `best_delta_z.json`；不会覆盖相机 NPY/TIFF。
+
+旧实验没有 `camera_stats_*.json` 或 raw frames 时，从平均 NPY 计算出的
+`saturation_fraction` 只是逐帧过曝率的近似估计，`best_delta_z.json` 会把推荐标为
+`selection_is_provisional: true`。这不影响均匀性、halo、FWHM 和 sharpness 的
+计算，但最终仍要确认原曝光没有削顶。新采集会逐点保存精确统计，断电后可直接
+恢复。
 
 ## 6. 最佳区域的 fine scan
 
@@ -247,4 +281,5 @@ VmbPy wheel 与 Vimba X SDK 版本不匹配。重新安装当前 Vimba X 安装�
 
 ### 输出目录已存在
 
-程序不会覆盖或混合旧实验结果。换一个新的 `--output-dir`。
+新拍摄不会覆盖或混合旧实验结果，应换一个新的 `--output-dir`。如果是恢复分析
+已有 NPY，则使用 `--analyze-existing 已有实验目录`，不要再次启动硬件采集。

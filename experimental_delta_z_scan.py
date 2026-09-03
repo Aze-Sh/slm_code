@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import time
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +42,70 @@ class AcquiredPoint:
     average_npy: Path
     average_tiff: Path
     raw_frames_npy: Path | None
+    saturation_fraction_source: str = "raw_frames"
+    saturation_fraction_is_exact: bool = True
+    peak_intensity_source: str = "raw_frames"
+    average_peak: float | None = None
+    acquisition_exposure_us: float | None = None
+    acquisition_frames_per_point: int | None = None
+    effective_saturation_level: float | None = None
+
+
+@dataclass(frozen=True)
+class _SpotWindow:
+    """One small circular spot mask, indexed relative to the analysis ROI."""
+
+    y_slice: slice
+    x_slice: slice
+    mask: np.ndarray
+    global_y_start: int
+    global_x_start: int
+
+
+@dataclass(frozen=True)
+class _CameraAverage:
+    average: np.ndarray
+    frame_dtype: np.dtype
+    frame_shape: tuple[int, int]
+    effective_saturation_level: float | None
+    peak_raw: float
+    saturation_fraction: float
+
+
+@dataclass(frozen=True)
+class _ExistingPointInfo:
+    point: ScanPoint
+    average_npy: Path
+    average_tiff: Path
+    raw_frames_npy: Path | None
+    saturation_fraction: float
+    peak_raw: float
+    saturation_fraction_source: str
+    saturation_fraction_is_exact: bool
+    peak_intensity_source: str
+    average_peak: float
+    acquisition_exposure_us: float | None
+    acquisition_frames_per_point: int | None
+    effective_saturation_level: float | None
+
+
+ProgressFn = Callable[[str], None] | None
+
+
+def _report(progress_fn: ProgressFn, message: str) -> None:
+    if progress_fn is not None:
+        progress_fn(message)
+
+
+def _close_memmap(array: np.ndarray) -> None:
+    memory_map = getattr(array, "_mmap", None)
+    if memory_map is not None and not memory_map.closed:
+        memory_map.close()
+
+
+def _close_acquired_memmaps(acquired: Sequence[AcquiredPoint]) -> None:
+    for result in acquired:
+        _close_memmap(result.average)
 
 
 def load_scan_points(scan_dir: str | Path) -> list[ScanPoint]:
@@ -167,19 +232,298 @@ def _prepare_experiment_directory(output_dir: str | Path) -> Path:
     return output_path
 
 
+def _effective_saturation_level(
+    dtype: np.dtype, saturation_level: float | None
+) -> float | None:
+    if saturation_level is not None:
+        if saturation_level <= 0:
+            raise ValueError("saturation_level must be positive")
+        return float(saturation_level)
+    if np.issubdtype(dtype, np.integer):
+        return float(np.iinfo(dtype).max)
+    return None
+
+
 def _saturation_statistics(
-    frame_stack: np.ndarray, saturation_level: float | None
+    frames: np.ndarray, saturation_level: float | None
 ) -> tuple[float, float]:
-    peak_raw = float(np.max(frame_stack))
-    if saturation_level is None:
-        if np.issubdtype(frame_stack.dtype, np.integer):
-            saturation_level = float(np.iinfo(frame_stack.dtype).max)
+    """Calculate raw statistics frame-by-frame without a full boolean copy."""
+    frame_array = np.asarray(frames)
+    if frame_array.ndim not in (2, 3):
+        raise ValueError("camera frames must be a 2-D image or 3-D stack")
+    effective_level = _effective_saturation_level(
+        frame_array.dtype, saturation_level
+    )
+    iterable = frame_array[None, ...] if frame_array.ndim == 2 else frame_array
+    peak_raw = -np.inf
+    saturated_pixels = 0
+    total_pixels = 0
+    for frame in iterable:
+        peak_raw = max(peak_raw, float(np.max(frame)))
+        if effective_level is not None:
+            saturated_pixels += int(np.count_nonzero(frame >= effective_level))
+        total_pixels += int(frame.size)
+    fraction = (
+        saturated_pixels / total_pixels if effective_level is not None else 0.0
+    )
+    return float(peak_raw), float(fraction)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, object]) -> None:
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, indent=2), encoding="utf-8"
+    )
+    temporary_path.replace(path)
+
+
+def _temporary_numpy_path(path: Path) -> Path:
+    return path.with_name(f".{path.stem}.tmp{path.suffix}")
+
+
+def _save_numpy_atomic(path: Path, array: np.ndarray) -> None:
+    temporary_path = _temporary_numpy_path(path)
+    np.save(temporary_path, array)
+    temporary_path.replace(path)
+
+
+def _save_average_tiff(
+    average: np.ndarray, path: Path, source_dtype: np.dtype
+) -> None:
+    """Preserve an 8-bit camera as 8-bit so ordinary viewers are not black."""
+    if np.issubdtype(source_dtype, np.integer):
+        if np.iinfo(source_dtype).max <= 255:
+            pixels = np.clip(np.rint(average), 0, 255).astype(np.uint8)
+            Image.fromarray(pixels, mode="L").save(path)
         else:
-            return peak_raw, 0.0
-    if saturation_level <= 0:
-        raise ValueError("saturation_level must be positive")
-    saturation_fraction = float(np.mean(frame_stack >= saturation_level))
-    return peak_raw, saturation_fraction
+            pixels = np.clip(np.rint(average), 0, 65535).astype(np.uint16)
+            Image.fromarray(pixels).save(path)
+    else:
+        Image.fromarray(np.asarray(average, dtype=np.float32), mode="F").save(
+            path
+        )
+
+
+def _save_preview_png(
+    image: np.ndarray, path: Path, *, upper: float | None = None
+) -> None:
+    image_array = np.asarray(image)
+    if upper is None:
+        upper = float(np.max(image_array))
+    preview = np.empty(image_array.shape, dtype=np.uint8)
+    if not np.isfinite(upper) or upper <= 0:
+        preview.fill(0)
+    else:
+        rows_per_chunk = max(1, 1_000_000 // max(1, image_array.shape[1]))
+        scale = np.float32(255.0 / upper)
+        for row_start in range(0, image_array.shape[0], rows_per_chunk):
+            row_stop = min(image_array.shape[0], row_start + rows_per_chunk)
+            scaled = np.array(
+                image_array[row_start:row_stop], dtype=np.float32, copy=True
+            )
+            np.multiply(scaled, scale, out=scaled)
+            np.clip(scaled, 0, 255, out=scaled)
+            preview[row_start:row_stop] = scaled.astype(np.uint8)
+    Image.fromarray(preview, mode="L").save(path)
+
+
+def _capture_camera_average(
+    camera,
+    *,
+    exposure_us: float,
+    frames_per_point: int,
+    expected_shape: tuple[int, int] | None,
+    saturation_level: float | None,
+    raw_frames_npy: Path | None,
+) -> _CameraAverage:
+    point_shape: tuple[int, int] | None = None
+    frame_dtype: np.dtype | None = None
+    average: np.ndarray | None = None
+    raw_frames: np.memmap | None = None
+    raw_temporary_path = (
+        _temporary_numpy_path(raw_frames_npy)
+        if raw_frames_npy is not None
+        else None
+    )
+    effective_level: float | None = None
+    peak_raw = -np.inf
+    saturated_pixels = 0
+    total_pixels = 0
+    try:
+        for frame_index in range(frames_per_point):
+            frame = np.asarray(camera.capture(exposure_us))
+            if frame.ndim == 3 and frame.shape[-1] == 1:
+                frame = frame[..., 0]
+            if frame.ndim != 2:
+                raise ValueError("camera frame must be a two-dimensional image")
+            if not np.issubdtype(frame.dtype, np.number):
+                raise ValueError("camera frame must have a numeric dtype")
+            if point_shape is None:
+                point_shape = tuple(int(value) for value in frame.shape)
+                frame_dtype = frame.dtype
+                if expected_shape is not None and point_shape != expected_shape:
+                    raise ValueError(
+                        "camera frame shape changed between scan points: "
+                        f"{expected_shape} -> {point_shape}"
+                    )
+                average = np.zeros(point_shape, dtype=np.float32)
+                effective_level = _effective_saturation_level(
+                    frame_dtype, saturation_level
+                )
+                if raw_temporary_path is not None:
+                    raw_frames = np.lib.format.open_memmap(
+                        raw_temporary_path,
+                        mode="w+",
+                        dtype=frame_dtype,
+                        shape=(frames_per_point, *point_shape),
+                    )
+            elif tuple(frame.shape) != point_shape:
+                raise ValueError(
+                    "camera frame shape changed during one scan point: "
+                    f"{point_shape} -> {tuple(frame.shape)}"
+                )
+            elif frame.dtype != frame_dtype:
+                raise ValueError(
+                    "camera frame dtype changed during one scan point: "
+                    f"{frame_dtype} -> {frame.dtype}"
+                )
+            if average is None:
+                raise RuntimeError("camera average accumulator was not initialized")
+            frame_minimum = float(np.min(frame))
+            frame_maximum = float(np.max(frame))
+            if not np.isfinite(frame_minimum) or not np.isfinite(frame_maximum):
+                raise ValueError("camera frame contains non-finite values")
+            np.add(average, frame, out=average, casting="unsafe")
+            if raw_frames is not None:
+                raw_frames[frame_index] = frame
+            peak_raw = max(peak_raw, frame_maximum)
+            if effective_level is not None:
+                saturated_pixels += int(
+                    np.count_nonzero(frame >= effective_level)
+                )
+            total_pixels += int(frame.size)
+
+        if point_shape is None or frame_dtype is None or average is None:
+            raise RuntimeError("no camera frames were acquired")
+        average *= np.float32(1.0 / frames_per_point)
+        saturation_fraction = (
+            saturated_pixels / total_pixels
+            if effective_level is not None
+            else 0.0
+        )
+        if raw_frames is not None and raw_temporary_path is not None:
+            raw_frames.flush()
+            _close_memmap(raw_frames)
+            raw_frames = None
+            raw_temporary_path.replace(raw_frames_npy)
+        return _CameraAverage(
+            average=average,
+            frame_dtype=frame_dtype,
+            frame_shape=point_shape,
+            effective_saturation_level=effective_level,
+            peak_raw=float(peak_raw),
+            saturation_fraction=float(saturation_fraction),
+        )
+    except BaseException:
+        if raw_frames is not None:
+            _close_memmap(raw_frames)
+        if raw_temporary_path is not None:
+            raw_temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def _acquire_one_scan_point(
+    point: ScanPoint,
+    display,
+    camera,
+    output_path: Path,
+    display_size_xy: tuple[int, int],
+    expected_camera_shape: tuple[int, int] | None,
+    *,
+    exposure_us: float,
+    frames_per_point: int,
+    settle_seconds: float,
+    correction: np.ndarray | None,
+    lut: int,
+    save_raw_frames: bool,
+    saturation_level: float | None,
+    sleep_fn,
+) -> AcquiredPoint:
+    with Image.open(point.bmp_path) as bitmap:
+        phase = np.asarray(bitmap.convert("L"), dtype=np.uint8)
+    calibrated = apply_slm_calibration(phase, correction=correction, lut=lut)
+    display_frame = center_phase_on_display(calibrated, display_size_xy)
+    display.updateArray(display_frame)
+    sleep_fn(settle_seconds)
+
+    raw_frames_npy = (
+        output_path / f"camera_raw_{point.scan_label}.npy"
+        if save_raw_frames
+        else None
+    )
+    captured = _capture_camera_average(
+        camera,
+        exposure_us=exposure_us,
+        frames_per_point=frames_per_point,
+        expected_shape=expected_camera_shape,
+        saturation_level=saturation_level,
+        raw_frames_npy=raw_frames_npy,
+    )
+    average_peak = float(np.max(captured.average))
+    average_npy = output_path / f"camera_average_{point.scan_label}.npy"
+    average_tiff = output_path / f"camera_average_{point.scan_label}.tiff"
+    _save_numpy_atomic(average_npy, captured.average)
+
+    statistics_path = output_path / f"camera_stats_{point.scan_label}.json"
+    _write_json_atomic(
+        statistics_path,
+        {
+            "scan_label": point.scan_label,
+            "delta_z_mm": point.delta_z_mm,
+            "frame_dtype": str(captured.frame_dtype),
+            "frame_shape_yx": list(captured.frame_shape),
+            "frames_per_point": frames_per_point,
+            "exposure_us": exposure_us,
+            "effective_saturation_level": (
+                captured.effective_saturation_level
+            ),
+            "peak_raw": captured.peak_raw,
+            "saturation_fraction": captured.saturation_fraction,
+            "statistics_source": "live_frames",
+        },
+    )
+
+    _save_average_tiff(captured.average, average_tiff, captured.frame_dtype)
+    preview_path = output_path / f"camera_preview_{point.scan_label}.png"
+    _save_preview_png(captured.average, preview_path)
+
+    average_mmap: np.memmap | None = None
+    try:
+        average_mmap = np.load(
+            average_npy, mmap_mode="r", allow_pickle=False
+        )
+        return AcquiredPoint(
+            point=point,
+            average=average_mmap,
+            saturation_fraction=captured.saturation_fraction,
+            peak_raw=captured.peak_raw,
+            average_npy=average_npy,
+            average_tiff=average_tiff,
+            raw_frames_npy=raw_frames_npy,
+            saturation_fraction_source="live_frames",
+            saturation_fraction_is_exact=(
+                captured.effective_saturation_level is not None
+            ),
+            peak_intensity_source="live_frames",
+            average_peak=average_peak,
+            acquisition_exposure_us=float(exposure_us),
+            acquisition_frames_per_point=frames_per_point,
+            effective_saturation_level=captured.effective_saturation_level,
+        )
+    except BaseException:
+        if average_mmap is not None:
+            _close_memmap(average_mmap)
+        raise
 
 
 def acquire_scan_points(
@@ -196,8 +540,9 @@ def acquire_scan_points(
     save_raw_frames: bool,
     saturation_level: float | None = None,
     sleep_fn=time.sleep,
+    progress_fn: ProgressFn = print,
 ) -> list[AcquiredPoint]:
-    """Display every phase and acquire a fixed-exposure AVT frame average."""
+    """Display phases and stream fixed-exposure frames into float32 averages."""
     if not points:
         raise ValueError("at least one scan point is required")
     if frames_per_point <= 0:
@@ -214,69 +559,41 @@ def acquire_scan_points(
 
     acquired: list[AcquiredPoint] = []
     camera_shape: tuple[int, int] | None = None
-    for point in points:
-        with Image.open(point.bmp_path) as bitmap:
-            phase = np.asarray(bitmap.convert("L"), dtype=np.uint8)
-        calibrated = apply_slm_calibration(
-            phase, correction=correction, lut=lut
+    point_count = len(points)
+    for point_index, point in enumerate(points, start=1):
+        _report(
+            progress_fn,
+            f"[acquire {point_index}/{point_count}] Displaying "
+            f"{point.scan_label}",
         )
-        display_frame = center_phase_on_display(calibrated, display_size_xy)
-        display.updateArray(display_frame)
-        sleep_fn(settle_seconds)
-
-        frames = []
-        point_shape: tuple[int, int] | None = None
-        for _ in range(frames_per_point):
-            frame = np.asarray(camera.capture(exposure_us))
-            if frame.ndim == 3 and frame.shape[-1] == 1:
-                frame = frame[..., 0]
-            if frame.ndim != 2:
-                raise ValueError("camera frame must be a two-dimensional image")
-            if point_shape is None:
-                point_shape = tuple(frame.shape)
-            elif tuple(frame.shape) != point_shape:
-                raise ValueError(
-                    "camera frame shape changed during one scan point: "
-                    f"{point_shape} -> {tuple(frame.shape)}"
-                )
-            frames.append(frame.copy())
-
-        frame_stack = np.stack(frames)
+        try:
+            result = _acquire_one_scan_point(
+                point,
+                display,
+                camera,
+                output_path,
+                display_size_xy,
+                camera_shape,
+                exposure_us=exposure_us,
+                frames_per_point=frames_per_point,
+                settle_seconds=settle_seconds,
+                correction=correction,
+                lut=lut,
+                save_raw_frames=save_raw_frames,
+                saturation_level=saturation_level,
+                sleep_fn=sleep_fn,
+            )
+        except BaseException:
+            _close_acquired_memmaps(acquired)
+            raise
         if camera_shape is None:
-            camera_shape = tuple(frame_stack.shape[1:])
-        elif tuple(frame_stack.shape[1:]) != camera_shape:
-            raise ValueError(
-                "camera frame shape changed between scan points: "
-                f"{camera_shape} -> {tuple(frame_stack.shape[1:])}"
-            )
-
-        average = frame_stack.astype(np.float64).mean(axis=0)
-        peak_raw, saturation_fraction = _saturation_statistics(
-            frame_stack, saturation_level
-        )
-        average_npy = output_path / f"camera_average_{point.scan_label}.npy"
-        average_tiff = output_path / f"camera_average_{point.scan_label}.tiff"
-        np.save(average_npy, average)
-        average_uint16 = np.clip(np.rint(average), 0, 65535).astype(np.uint16)
-        Image.fromarray(average_uint16).save(average_tiff)
-
-        raw_frames_npy = None
-        if save_raw_frames:
-            raw_frames_npy = (
-                output_path / f"camera_raw_{point.scan_label}.npy"
-            )
-            np.save(raw_frames_npy, frame_stack)
-
-        acquired.append(
-            AcquiredPoint(
-                point=point,
-                average=average,
-                saturation_fraction=saturation_fraction,
-                peak_raw=peak_raw,
-                average_npy=average_npy,
-                average_tiff=average_tiff,
-                raw_frames_npy=raw_frames_npy,
-            )
+            camera_shape = tuple(int(value) for value in result.average.shape)
+        acquired.append(result)
+        _report(
+            progress_fn,
+            f"[acquire {point_index}/{point_count}] Saved camera average "
+            f"(peak={result.peak_raw:g}, "
+            f"saturation={result.saturation_fraction:.3g})",
         )
     return acquired
 
@@ -290,13 +607,17 @@ def _background_correct(
     image: np.ndarray, background_percentile: float
 ) -> np.ndarray:
     _validate_background_percentile(background_percentile)
-    image_array = np.asarray(image, dtype=np.float64)
+    image_array = np.array(image, dtype=np.float32, copy=True)
     if image_array.ndim != 2:
         raise ValueError("camera image must be two-dimensional")
-    if not np.all(np.isfinite(image_array)):
+    image_minimum = float(np.min(image_array))
+    image_maximum = float(np.max(image_array))
+    if not np.isfinite(image_minimum) or not np.isfinite(image_maximum):
         raise ValueError("camera image contains non-finite values")
     baseline = float(np.percentile(image_array, background_percentile))
-    return np.clip(image_array - baseline, 0.0, None)
+    np.subtract(image_array, baseline, out=image_array)
+    np.maximum(image_array, 0.0, out=image_array)
+    return image_array
 
 
 def _roi_slices(
@@ -317,14 +638,15 @@ def _roi_slices(
 
 
 def detect_common_spots(
-    images: list[np.ndarray],
+    images: Sequence[np.ndarray],
     expected_count: int,
     *,
     roi_xywh: tuple[int, int, int, int] | None = None,
     min_peak_distance_px: int = 8,
     background_percentile: float = 10.0,
+    progress_fn: ProgressFn = None,
 ) -> np.ndarray:
-    """Detect one common, fixed set of spot centers for the complete scan."""
+    """Detect fixed centers from an equal-weight, ROI-sized reference image."""
     if not images:
         raise ValueError("at least one camera image is required")
     if expected_count <= 0:
@@ -335,37 +657,60 @@ def detect_common_spots(
     first_shape = tuple(np.asarray(images[0]).shape)
     if len(first_shape) != 2:
         raise ValueError("camera image must be two-dimensional")
-    normalized_images = []
-    for image in images:
+    y_slice, x_slice = _roi_slices(first_shape, roi_xywh)
+    roi_shape = (
+        int(y_slice.stop - y_slice.start),
+        int(x_slice.stop - x_slice.start),
+    )
+    reference = np.zeros(roi_shape, dtype=np.float32)
+    image_count = len(images)
+    for image_index, image in enumerate(images, start=1):
         if tuple(np.asarray(image).shape) != first_shape:
             raise ValueError("all camera images must have the same shape")
-        corrected = _background_correct(image, background_percentile)
-        total = float(np.sum(corrected))
+        corrected = _background_correct(
+            np.asarray(image)[y_slice, x_slice], background_percentile
+        )
+        total = float(np.sum(corrected, dtype=np.float64))
         if total <= 0:
             raise ValueError("camera image has no signal above background")
-        normalized_images.append(corrected / total)
-    reference = np.mean(normalized_images, axis=0)
+        corrected *= np.float32(1.0 / total)
+        reference += corrected
+        _report(
+            progress_fn,
+            f"[detect {image_index}/{image_count}] Added normalized ROI "
+            "to common reference",
+        )
+    reference *= np.float32(1.0 / image_count)
 
-    y_slice, x_slice = _roi_slices(first_shape, roi_xywh)
-    roi_reference = reference[y_slice, x_slice]
     filter_size = 2 * min_peak_distance_px + 1
     local_maximum = ndimage.maximum_filter(
-        roi_reference,
+        reference,
         size=filter_size,
         mode="constant",
         cval=-np.inf,
     )
-    maxima_mask = (roi_reference == local_maximum) & (roi_reference > 0)
+    maxima_mask = (reference == local_maximum) & (reference > 0)
     labels, component_count = ndimage.label(maxima_mask)
     candidates = []
-    for label_index in range(1, component_count + 1):
-        component_coordinates = np.argwhere(labels == label_index)
-        component_values = roi_reference[labels == label_index]
-        best_coordinate = component_coordinates[int(np.argmax(component_values))]
-        candidate_y = int(best_coordinate[0] + y_slice.start)
-        candidate_x = int(best_coordinate[1] + x_slice.start)
+    component_slices = ndimage.find_objects(labels, max_label=component_count)
+    for label_index, component_slice in enumerate(component_slices, start=1):
+        if component_slice is None:
+            continue
+        component_labels = labels[component_slice]
+        component_reference = reference[component_slice]
+        component_values = np.where(
+            component_labels == label_index, component_reference, -np.inf
+        )
+        local_flat_index = int(np.argmax(component_values))
+        local_y, local_x = np.unravel_index(
+            local_flat_index, component_values.shape
+        )
+        roi_y = int(component_slice[0].start + local_y)
+        roi_x = int(component_slice[1].start + local_x)
+        candidate_y = int(roi_y + y_slice.start)
+        candidate_x = int(roi_x + x_slice.start)
         candidates.append(
-            (float(np.max(component_values)), candidate_y, candidate_x)
+            (float(reference[roi_y, roi_x]), candidate_y, candidate_x)
         )
     candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
@@ -401,15 +746,83 @@ def _infer_spot_radius(centers: np.ndarray) -> float:
     return max(2.0, 0.35 * nearest_neighbor_distance)
 
 
+def _build_spot_windows(
+    image_shape: tuple[int, int],
+    centers: np.ndarray,
+    radius: float,
+    roi_xywh: tuple[int, int, int, int] | None,
+) -> tuple[np.ndarray, list[_SpotWindow], tuple[int, int]]:
+    """Build one ROI union mask and one tiny mask per target spot."""
+    height, width = image_shape
+    center_array = np.asarray(centers, dtype=int)
+    if np.any(center_array[:, 0] < 0) or np.any(center_array[:, 0] >= height):
+        raise ValueError("spot center y coordinate lies outside the image")
+    if np.any(center_array[:, 1] < 0) or np.any(center_array[:, 1] >= width):
+        raise ValueError("spot center x coordinate lies outside the image")
+
+    roi_y_slice, roi_x_slice = _roi_slices(image_shape, roi_xywh)
+    roi_y_start = int(roi_y_slice.start)
+    roi_y_stop = int(roi_y_slice.stop)
+    roi_x_start = int(roi_x_slice.start)
+    roi_x_stop = int(roi_x_slice.stop)
+    roi_shape = (
+        roi_y_stop - roi_y_start,
+        roi_x_stop - roi_x_start,
+    )
+    target_mask = np.zeros(roi_shape, dtype=bool)
+    windows: list[_SpotWindow] = []
+    half_width = int(np.ceil(radius))
+    for center_y, center_x in center_array:
+        if not (
+            roi_y_start <= center_y < roi_y_stop
+            and roi_x_start <= center_x < roi_x_stop
+        ):
+            raise ValueError("spot center lies outside the camera ROI")
+        global_y_start = max(roi_y_start, int(center_y) - half_width)
+        global_y_stop = min(roi_y_stop, int(center_y) + half_width + 1)
+        global_x_start = max(roi_x_start, int(center_x) - half_width)
+        global_x_stop = min(roi_x_stop, int(center_x) + half_width + 1)
+        y_coordinates = np.arange(global_y_start, global_y_stop)[:, None]
+        x_coordinates = np.arange(global_x_start, global_x_stop)[None, :]
+        mask = (
+            (y_coordinates - center_y) ** 2
+            + (x_coordinates - center_x) ** 2
+            <= radius**2
+        )
+        local_y_slice = slice(
+            global_y_start - roi_y_start, global_y_stop - roi_y_start
+        )
+        local_x_slice = slice(
+            global_x_start - roi_x_start, global_x_stop - roi_x_start
+        )
+        target_region = target_mask[local_y_slice, local_x_slice]
+        np.logical_or(target_region, mask, out=target_region)
+        windows.append(
+            _SpotWindow(
+                y_slice=local_y_slice,
+                x_slice=local_x_slice,
+                mask=mask,
+                global_y_start=global_y_start,
+                global_x_start=global_x_start,
+            )
+        )
+    return target_mask, windows, (roi_y_start, roi_x_start)
+
+
 def _spot_shape_metrics(
-    signal: np.ndarray, mask: np.ndarray, y_grid: np.ndarray, x_grid: np.ndarray
+    signal_patch: np.ndarray,
+    mask: np.ndarray,
+    global_y_start: int,
+    global_x_start: int,
 ) -> tuple[float, float, float]:
-    values = signal[mask]
-    if values.size == 0 or float(np.sum(values)) <= 0:
+    values = signal_patch[mask]
+    spot_sum = float(np.sum(values, dtype=np.float64))
+    if values.size == 0 or spot_sum <= 0:
         return float("inf"), float("inf"), 0.0
 
-    mask_y = y_grid[mask]
-    mask_x = x_grid[mask]
+    local_y, local_x = np.nonzero(mask)
+    mask_y = local_y + global_y_start
+    mask_x = local_x + global_x_start
     peak_index = int(np.argmax(values))
     peak_y = float(mask_y[peak_index])
     peak_x = float(mask_x[peak_index])
@@ -419,13 +832,14 @@ def _spot_shape_metrics(
     distances = np.sqrt((mask_y - peak_y) ** 2 + (mask_x - peak_x) ** 2)
     order = np.argsort(distances)
     ordered_values = values[order]
-    cumulative = np.cumsum(ordered_values)
+    cumulative = np.cumsum(ordered_values, dtype=np.float64)
     radius_index = int(np.searchsorted(cumulative, 0.5 * cumulative[-1]))
     radius_index = min(radius_index, len(order) - 1)
     encircled_energy_radius_50 = float(distances[order[radius_index]])
 
-    spot_sum = float(np.sum(values))
-    sharpness = float(np.sum(np.square(values)) / spot_sum**2)
+    sharpness = float(
+        np.sum(np.square(values), dtype=np.float64) / spot_sum**2
+    )
     return float(equivalent_fwhm), encircled_energy_radius_50, sharpness
 
 
@@ -436,6 +850,7 @@ def analyze_acquired_points(
     spot_radius_px: float | None = None,
     roi_xywh: tuple[int, int, int, int] | None = None,
     background_percentile: float = 10.0,
+    progress_fn: ProgressFn = None,
 ) -> tuple[list[dict[str, float | str]], float]:
     """Measure each scan point with one fixed set of circular target ROIs."""
     if not acquired:
@@ -454,30 +869,22 @@ def analyze_acquired_points(
     image_shape = tuple(np.asarray(acquired[0].average).shape)
     if len(image_shape) != 2:
         raise ValueError("camera image must be two-dimensional")
-    height, width = image_shape
-    if np.any(center_array[:, 0] < 0) or np.any(center_array[:, 0] >= height):
-        raise ValueError("spot center y coordinate lies outside the image")
-    if np.any(center_array[:, 1] < 0) or np.any(center_array[:, 1] >= width):
-        raise ValueError("spot center x coordinate lies outside the image")
-
-    y_slice, x_slice = _roi_slices(image_shape, roi_xywh)
-    analysis_mask = np.zeros(image_shape, dtype=bool)
-    analysis_mask[y_slice, x_slice] = True
-    y_grid, x_grid = np.indices(image_shape, dtype=np.float64)
-    spot_masks = [
-        ((y_grid - center_y) ** 2 + (x_grid - center_x) ** 2 <= radius**2)
-        & analysis_mask
-        for center_y, center_x in center_array
-    ]
-    target_mask = np.logical_or.reduce(spot_masks)
+    target_mask, spot_windows, (roi_y_start, roi_x_start) = (
+        _build_spot_windows(image_shape, center_array, radius, roi_xywh)
+    )
+    roi_y_slice, roi_x_slice = _roi_slices(image_shape, roi_xywh)
+    roi_height, roi_width = target_mask.shape
 
     rows: list[dict[str, float | str]] = []
-    for result in acquired:
+    result_count = len(acquired)
+    for result_index, result in enumerate(acquired, start=1):
         if tuple(np.asarray(result.average).shape) != image_shape:
             raise ValueError("all acquired camera images must have the same shape")
-        signal = _background_correct(result.average, background_percentile)
-        signal = np.where(analysis_mask, signal, 0.0)
-        total_signal = float(np.sum(signal))
+        signal = _background_correct(
+            np.asarray(result.average)[roi_y_slice, roi_x_slice],
+            background_percentile,
+        )
+        total_signal = float(np.sum(signal, dtype=np.float64))
         if total_signal <= 0:
             raise ValueError(
                 f"camera image has no signal above background: "
@@ -485,7 +892,15 @@ def analyze_acquired_points(
             )
 
         spot_sums = np.asarray(
-            [float(np.sum(signal[mask])) for mask in spot_masks]
+            [
+                float(
+                    np.sum(
+                        signal[window.y_slice, window.x_slice][window.mask],
+                        dtype=np.float64,
+                    )
+                )
+                for window in spot_windows
+            ]
         )
         maximum_spot_sum = float(np.max(spot_sums))
         target_uniformity = (
@@ -499,22 +914,42 @@ def analyze_acquired_points(
             if mean_spot_sum > 0
             else float("inf")
         )
-        target_signal = float(np.sum(signal[target_mask]))
+        target_signal = float(
+            np.sum(signal[target_mask], dtype=np.float64)
+        )
         target_efficiency = target_signal / total_signal
         background_halo = 1.0 - target_efficiency
 
-        normalized_signal = signal / total_signal
-        centroid_x = float(np.sum(x_grid * normalized_signal))
-        centroid_y = float(np.sum(y_grid * normalized_signal))
+        row_sums = np.sum(signal, axis=1, dtype=np.float64)
+        column_sums = np.sum(signal, axis=0, dtype=np.float64)
+        centroid_y = float(
+            np.dot(
+                np.arange(roi_y_start, roi_y_start + roi_height), row_sums
+            )
+            / total_signal
+        )
+        centroid_x = float(
+            np.dot(
+                np.arange(roi_x_start, roi_x_start + roi_width), column_sums
+            )
+            / total_signal
+        )
         peak_flat_index = int(np.argmax(signal))
-        peak_y, peak_x = divmod(peak_flat_index, width)
+        local_peak_y, local_peak_x = divmod(peak_flat_index, roi_width)
+        peak_y = local_peak_y + roi_y_start
+        peak_x = local_peak_x + roi_x_start
         centroid_peak_offset = float(
             np.hypot(centroid_x - peak_x, centroid_y - peak_y)
         )
 
         per_spot_metrics = [
-            _spot_shape_metrics(signal, mask, y_grid, x_grid)
-            for mask in spot_masks
+            _spot_shape_metrics(
+                signal[window.y_slice, window.x_slice],
+                window.mask,
+                window.global_y_start,
+                window.global_x_start,
+            )
+            for window in spot_windows
         ]
         mean_fwhm = float(np.mean([metric[0] for metric in per_spot_metrics]))
         mean_radius_50 = float(
@@ -536,6 +971,13 @@ def analyze_acquired_points(
                 "background_halo": background_halo,
                 "peak_intensity": result.peak_raw,
                 "saturation_fraction": result.saturation_fraction,
+                "saturation_fraction_source": (
+                    result.saturation_fraction_source
+                ),
+                "saturation_fraction_is_exact": (
+                    result.saturation_fraction_is_exact
+                ),
+                "peak_intensity_source": result.peak_intensity_source,
                 "centroid_x_px": centroid_x,
                 "centroid_y_px": centroid_y,
                 "peak_x_px": float(peak_x),
@@ -545,6 +987,11 @@ def analyze_acquired_points(
                 "mean_encircled_energy_radius_50_px": mean_radius_50,
                 "mean_spot_sharpness": mean_sharpness,
             }
+        )
+        _report(
+            progress_fn,
+            f"[analyze {result_index}/{result_count}] Measured "
+            f"{result.point.scan_label}",
         )
     return rows, radius
 
@@ -612,10 +1059,12 @@ def _write_experimental_metrics(
     rows: list[dict[str, float | str | bool]], output_path: Path
 ) -> None:
     csv_path = output_path / "experimental_metrics.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+    temporary_path = output_path / ".experimental_metrics.csv.tmp"
+    with temporary_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+    temporary_path.replace(csv_path)
 
 
 def _write_experimental_plot(
@@ -643,15 +1092,49 @@ def _write_experimental_plot(
     for axis in axes[-1]:
         axis.set_xlabel("delta_z (mm)")
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    temporary_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    figure.savefig(temporary_path, dpi=180)
     plt.close(figure)
+    temporary_path.replace(path)
+
+
+def _write_common_previews(
+    acquired: Sequence[AcquiredPoint],
+    output_path: Path,
+    *,
+    progress_fn: ProgressFn = None,
+) -> None:
+    """Write comparable 8-bit previews using one scale for the whole scan."""
+    common_upper = max(
+        (
+            float(result.average_peak)
+            if result.average_peak is not None
+            else float(np.max(result.average))
+        )
+        for result in acquired
+    )
+    result_count = len(acquired)
+    for result_index, result in enumerate(acquired, start=1):
+        preview_path = (
+            output_path / f"camera_preview_{result.point.scan_label}.png"
+        )
+        _save_preview_png(result.average, preview_path, upper=common_upper)
+        _close_memmap(result.average)
+        _report(
+            progress_fn,
+            f"[preview {result_index}/{result_count}] Wrote "
+            f"{preview_path.name}",
+        )
 
 
 def _write_spot_overlay(
-    acquired: list[AcquiredPoint],
+    acquired: Sequence[AcquiredPoint],
     centers: np.ndarray,
     radius: float,
     path: Path,
+    *,
+    roi_xywh: tuple[int, int, int, int] | None = None,
+    progress_fn: ProgressFn = None,
 ) -> None:
     import matplotlib
 
@@ -659,15 +1142,42 @@ def _write_spot_overlay(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
 
-    normalized_images = []
-    for result in acquired:
-        image = np.asarray(result.average, dtype=np.float64)
+    image_shape = tuple(np.asarray(acquired[0].average).shape)
+    y_slice, x_slice = _roi_slices(image_shape, roi_xywh)
+    reference = np.zeros(
+        (y_slice.stop - y_slice.start, x_slice.stop - x_slice.start),
+        dtype=np.float32,
+    )
+    result_count = len(acquired)
+    for result_index, result in enumerate(acquired, start=1):
+        image = np.array(
+            np.asarray(result.average)[y_slice, x_slice],
+            dtype=np.float32,
+            copy=True,
+        )
         scale = float(np.max(image))
-        normalized_images.append(image / scale if scale > 0 else image)
-    reference = np.mean(normalized_images, axis=0)
+        if scale > 0:
+            image *= np.float32(1.0 / scale)
+        reference += image
+        _report(
+            progress_fn,
+            f"[overlay {result_index}/{result_count}] Added "
+            f"{result.point.scan_label}",
+        )
+    reference *= np.float32(1.0 / result_count)
 
     figure, axis = plt.subplots(figsize=(8, 7))
-    image_handle = axis.imshow(reference, cmap="gray")
+    image_handle = axis.imshow(
+        reference,
+        cmap="gray",
+        origin="upper",
+        extent=(
+            x_slice.start - 0.5,
+            x_slice.stop - 0.5,
+            y_slice.stop - 0.5,
+            y_slice.start - 0.5,
+        ),
+    )
     for index, (center_y, center_x) in enumerate(centers):
         axis.add_patch(
             Circle(
@@ -690,8 +1200,10 @@ def _write_spot_overlay(
     axis.set_title("Common CCD spot ROIs used for every delta_z")
     figure.colorbar(image_handle, ax=axis, shrink=0.8)
     figure.tight_layout()
-    figure.savefig(path, dpi=180)
+    temporary_path = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    figure.savefig(temporary_path, dpi=180)
     plt.close(figure)
+    temporary_path.replace(path)
 
 
 def _load_source_scan_parameters(scan_directory: Path) -> dict[str, object] | None:
@@ -700,6 +1212,446 @@ def _load_source_scan_parameters(scan_directory: Path) -> dict[str, object] | No
         return None
     with parameters_path.open(encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _load_point_statistics(path: Path) -> dict[str, object] | None:
+    if not path.is_file():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"camera statistics must contain an object: {path}")
+    return payload
+
+
+def _validate_point_statistics(
+    payload: dict[str, object],
+    path: Path,
+    point: ScanPoint,
+    image_shape: tuple[int, int],
+) -> None:
+    required = {
+        "scan_label",
+        "delta_z_mm",
+        "frame_dtype",
+        "frame_shape_yx",
+        "frames_per_point",
+        "exposure_us",
+        "effective_saturation_level",
+        "peak_raw",
+        "saturation_fraction",
+    }
+    missing = required.difference(payload)
+    if missing:
+        raise ValueError(
+            f"camera statistics are missing {sorted(missing)}: {path}"
+        )
+    try:
+        delta_z_mm = float(payload["delta_z_mm"])
+        frames_per_point = int(payload["frames_per_point"])
+        exposure_us = float(payload["exposure_us"])
+        peak_raw = float(payload["peak_raw"])
+        saturation_fraction = float(payload["saturation_fraction"])
+        frame_shape = tuple(int(value) for value in payload["frame_shape_yx"])
+        saved_level = payload["effective_saturation_level"]
+        effective_level = (
+            None if saved_level is None else float(saved_level)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"camera statistics contain invalid values: {path}") from error
+    if payload["scan_label"] != point.scan_label:
+        raise ValueError(f"camera statistics scan_label does not match: {path}")
+    if not np.isfinite(delta_z_mm) or not np.isclose(
+        delta_z_mm, point.delta_z_mm
+    ):
+        raise ValueError(f"camera statistics delta_z does not match: {path}")
+    if frame_shape != image_shape:
+        raise ValueError(f"camera statistics frame shape does not match: {path}")
+    if frames_per_point <= 0 or frames_per_point != payload["frames_per_point"]:
+        raise ValueError(f"camera statistics frame count is invalid: {path}")
+    if not np.isfinite(exposure_us) or exposure_us <= 0:
+        raise ValueError(f"camera statistics exposure is invalid: {path}")
+    if not isinstance(payload["frame_dtype"], str) or not payload["frame_dtype"]:
+        raise ValueError(f"camera statistics frame dtype is invalid: {path}")
+    if effective_level is not None and (
+        not np.isfinite(effective_level) or effective_level <= 0
+    ):
+        raise ValueError(f"camera statistics saturation level is invalid: {path}")
+    if not np.isfinite(peak_raw):
+        raise ValueError(f"camera statistics peak is invalid: {path}")
+    if not np.isfinite(saturation_fraction) or not 0 <= saturation_fraction <= 1:
+        raise ValueError(
+            f"camera statistics saturation fraction is invalid: {path}"
+        )
+
+
+def _inspect_existing_point(
+    point: ScanPoint,
+    output_path: Path,
+    expected_shape: tuple[int, int] | None,
+    saturation_level: float | None,
+) -> tuple[_ExistingPointInfo, tuple[int, int]]:
+    average_npy = output_path / f"camera_average_{point.scan_label}.npy"
+    if not average_npy.is_file():
+        raise FileNotFoundError(
+            f"camera average missing for {point.scan_label}: {average_npy}"
+        )
+
+    average: np.memmap | None = None
+    raw_frames: np.memmap | None = None
+    try:
+        try:
+            average = np.load(
+                average_npy, mmap_mode="r", allow_pickle=False
+            )
+        except (OSError, ValueError) as error:
+            raise ValueError(
+                f"cannot load camera average for {point.scan_label}: "
+                f"{average_npy}"
+            ) from error
+        if average.ndim != 2:
+            raise ValueError(
+                f"camera average for {point.scan_label} must be two-dimensional"
+            )
+        if not np.issubdtype(average.dtype, np.number):
+            raise ValueError(
+                f"camera average for {point.scan_label} must be numeric"
+            )
+        current_shape = tuple(int(value) for value in average.shape)
+        if expected_shape is not None and current_shape != expected_shape:
+            raise ValueError(
+                "camera average shape changed between scan points: "
+                f"{expected_shape} -> {current_shape} ({point.scan_label})"
+            )
+        average_minimum = float(np.min(average))
+        average_peak = float(np.max(average))
+        if not np.isfinite(average_minimum) or not np.isfinite(average_peak):
+            raise ValueError(
+                f"camera average contains non-finite values: {point.scan_label}"
+            )
+
+        raw_path = output_path / f"camera_raw_{point.scan_label}.npy"
+        raw_frames_npy = raw_path if raw_path.is_file() else None
+        stats_path = output_path / f"camera_stats_{point.scan_label}.json"
+        statistics = _load_point_statistics(stats_path)
+        if statistics is not None:
+            _validate_point_statistics(
+                statistics, stats_path, point, current_shape
+            )
+        saved_level = (
+            statistics.get("effective_saturation_level")
+            if statistics is not None
+            else None
+        )
+        acquisition_exposure_us = (
+            float(statistics["exposure_us"])
+            if statistics is not None
+            else None
+        )
+        acquisition_frames_per_point = (
+            int(statistics["frames_per_point"])
+            if statistics is not None
+            else None
+        )
+
+        if raw_frames_npy is not None:
+            try:
+                raw_frames = np.load(
+                    raw_frames_npy, mmap_mode="r", allow_pickle=False
+                )
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"cannot load raw frames for {point.scan_label}: "
+                    f"{raw_frames_npy}"
+                ) from error
+            if raw_frames.ndim != 3 or tuple(raw_frames.shape[1:]) != current_shape:
+                raise ValueError(
+                    f"raw camera stack shape is invalid for {point.scan_label}"
+                )
+            if statistics is not None and (
+                str(raw_frames.dtype) != str(statistics["frame_dtype"])
+                or int(raw_frames.shape[0])
+                != int(statistics["frames_per_point"])
+            ):
+                raise ValueError(
+                    "raw camera stack does not match camera statistics for "
+                    f"{point.scan_label}"
+                )
+            if acquisition_frames_per_point is None:
+                acquisition_frames_per_point = int(raw_frames.shape[0])
+            raw_saturation_level = (
+                saturation_level
+                if saturation_level is not None
+                else (float(saved_level) if saved_level is not None else None)
+            )
+            peak_raw, saturation_fraction = _saturation_statistics(
+                raw_frames, raw_saturation_level
+            )
+            effective_level = _effective_saturation_level(
+                raw_frames.dtype, raw_saturation_level
+            )
+            saturation_source = "raw_frames"
+            saturation_is_exact = effective_level is not None
+            peak_source = "raw_frames"
+        else:
+            compatible_statistics = statistics is not None and (
+                saturation_level is None
+                or (
+                    saved_level is not None
+                    and float(saved_level) == float(saturation_level)
+                )
+            )
+            if compatible_statistics:
+                peak_raw = float(statistics["peak_raw"])
+                saturation_fraction = float(
+                    statistics["saturation_fraction"]
+                )
+                saturation_source = "acquisition_sidecar"
+                saturation_is_exact = saved_level is not None
+                peak_source = "live_frames"
+                effective_level = (
+                    float(saved_level) if saved_level is not None else None
+                )
+            else:
+                if saturation_level is None:
+                    raise ValueError(
+                        "--saturation-level is required when existing averages "
+                        "have no raw frames or compatible camera_stats files"
+                    )
+                peak_raw = average_peak
+                saturation_fraction = float(
+                    np.count_nonzero(average >= saturation_level) / average.size
+                )
+                saturation_source = "average_threshold_estimate"
+                saturation_is_exact = False
+                peak_source = "average"
+                effective_level = float(saturation_level)
+
+        return (
+            _ExistingPointInfo(
+                point=point,
+                average_npy=average_npy,
+                average_tiff=(
+                    output_path / f"camera_average_{point.scan_label}.tiff"
+                ),
+                raw_frames_npy=raw_frames_npy,
+                saturation_fraction=float(saturation_fraction),
+                peak_raw=float(peak_raw),
+                saturation_fraction_source=saturation_source,
+                saturation_fraction_is_exact=saturation_is_exact,
+                peak_intensity_source=peak_source,
+                average_peak=average_peak,
+                acquisition_exposure_us=acquisition_exposure_us,
+                acquisition_frames_per_point=acquisition_frames_per_point,
+                effective_saturation_level=effective_level,
+            ),
+            current_shape,
+        )
+    finally:
+        if raw_frames is not None:
+            _close_memmap(raw_frames)
+        if average is not None:
+            _close_memmap(average)
+
+
+def load_existing_acquired_points(
+    points: Sequence[ScanPoint],
+    acquisition_dir: str | Path,
+    *,
+    saturation_level: float | None,
+    progress_fn: ProgressFn = print,
+) -> list[AcquiredPoint]:
+    """Memory-map averages left by a completed/interrupted hardware run."""
+    if not points:
+        raise ValueError("at least one scan point is required")
+    if saturation_level is not None and saturation_level <= 0:
+        raise ValueError("saturation_level must be positive")
+    output_path = Path(acquisition_dir)
+    if not output_path.is_dir():
+        raise NotADirectoryError(
+            f"existing acquisition directory not found: {output_path}"
+        )
+
+    inspected: list[_ExistingPointInfo] = []
+    image_shape: tuple[int, int] | None = None
+    point_count = len(points)
+    for point_index, point in enumerate(points, start=1):
+        point_info, current_shape = _inspect_existing_point(
+            point, output_path, image_shape, saturation_level
+        )
+        if image_shape is None:
+            image_shape = current_shape
+        inspected.append(point_info)
+        _report(
+            progress_fn,
+            f"[load {point_index}/{point_count}] Validated "
+            f"{point_info.average_npy.name}",
+        )
+
+    acquired: list[AcquiredPoint] = []
+    try:
+        for point_info in inspected:
+            average = np.load(
+                point_info.average_npy, mmap_mode="r", allow_pickle=False
+            )
+            acquired.append(
+                AcquiredPoint(
+                    point=point_info.point,
+                    average=average,
+                    saturation_fraction=point_info.saturation_fraction,
+                    peak_raw=point_info.peak_raw,
+                    average_npy=point_info.average_npy,
+                    average_tiff=point_info.average_tiff,
+                    raw_frames_npy=point_info.raw_frames_npy,
+                    saturation_fraction_source=(
+                        point_info.saturation_fraction_source
+                    ),
+                    saturation_fraction_is_exact=(
+                        point_info.saturation_fraction_is_exact
+                    ),
+                    peak_intensity_source=point_info.peak_intensity_source,
+                    average_peak=point_info.average_peak,
+                    acquisition_exposure_us=(
+                        point_info.acquisition_exposure_us
+                    ),
+                    acquisition_frames_per_point=(
+                        point_info.acquisition_frames_per_point
+                    ),
+                    effective_saturation_level=(
+                        point_info.effective_saturation_level
+                    ),
+                )
+            )
+    except BaseException:
+        _close_acquired_memmaps(acquired)
+        raise
+    return acquired
+
+
+def _analyze_and_write_results(
+    acquired: list[AcquiredPoint],
+    output_path: Path,
+    *,
+    expected_spots: int,
+    roi_xywh: tuple[int, int, int, int] | None,
+    min_peak_distance_px: int,
+    spot_radius_px: float | None,
+    background_percentile: float,
+    maximum_saturation_fraction: float,
+    run_parameters: dict[str, object],
+    progress_fn: ProgressFn,
+) -> tuple[
+    list[dict[str, float | str | bool]], dict[str, float | str | bool]
+]:
+    """Run the shared memory-bounded analysis and write derived outputs."""
+    _report(progress_fn, "[analysis] Detecting one common set of spot centers")
+    centers = detect_common_spots(
+        [result.average for result in acquired],
+        expected_spots,
+        roi_xywh=roi_xywh,
+        min_peak_distance_px=min_peak_distance_px,
+        background_percentile=background_percentile,
+        progress_fn=progress_fn,
+    )
+    _report(
+        progress_fn,
+        f"[analysis] Detected {len(centers)} spots; measuring scan points",
+    )
+    metric_rows, resolved_spot_radius = analyze_acquired_points(
+        acquired,
+        centers,
+        spot_radius_px=spot_radius_px,
+        roi_xywh=roi_xywh,
+        background_percentile=background_percentile,
+        progress_fn=progress_fn,
+    )
+    ranked_rows, best = rank_quality(
+        metric_rows,
+        maximum_saturation_fraction=maximum_saturation_fraction,
+    )
+
+    _report(progress_fn, "[output] Writing metrics, plots, and previews")
+    _write_experimental_metrics(ranked_rows, output_path)
+    _write_experimental_plot(
+        ranked_rows, output_path / "experimental_metrics_vs_delta_z.png"
+    )
+    _write_spot_overlay(
+        acquired,
+        centers,
+        resolved_spot_radius,
+        output_path / "detected_spots.png",
+        roi_xywh=roi_xywh,
+        progress_fn=progress_fn,
+    )
+    _write_common_previews(
+        acquired, output_path, progress_fn=progress_fn
+    )
+
+    selection_is_provisional = not all(
+        result.saturation_fraction_is_exact for result in acquired
+    )
+    best_payload: dict[str, object] = {
+        "delta_z_mm": float(best["delta_z_mm"]),
+        "scan_label": str(best["scan_label"]),
+        "quality_score": float(best["quality_score"]),
+        "selection_is_provisional": selection_is_provisional,
+        "selection": (
+            "Highest equal-weight scan-normalized score from uniformity, "
+            "spot sharpness, inverse halo, and inverse FWHM among points "
+            "that did not exceed the configured saturation threshold."
+        ),
+    }
+    if selection_is_provisional:
+        best_payload["warning"] = (
+            "Raw-frame saturation information was unavailable for at least "
+            "one scan point. Thresholding an averaged image is only an "
+            "estimate of per-frame saturation, so this selection is provisional."
+        )
+    _write_json_atomic(output_path / "best_delta_z.json", best_payload)
+
+    sources = sorted(
+        {result.saturation_fraction_source for result in acquired}
+    )
+    saturation_source = sources[0] if len(sources) == 1 else "mixed"
+    scan_directory = acquired[0].point.bmp_path.parent
+    parameters: dict[str, object] = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "analysis_version": 2,
+        "analysis_memory_strategy": "streamed_float32_roi_local_spot_windows",
+        "source_scan_directory": str(scan_directory.resolve()),
+        "source_scan_parameters": _load_source_scan_parameters(scan_directory),
+        "scan_count": len(acquired),
+        "maximum_saturation_fraction": maximum_saturation_fraction,
+        "saturation_fraction_source": saturation_source,
+        "saturation_fraction_exact_for_all_points": (
+            not selection_is_provisional
+        ),
+        "camera_roi_xywh": list(roi_xywh) if roi_xywh is not None else None,
+        "background_scope": "camera_roi",
+        "expected_spots": expected_spots,
+        "min_peak_distance_px": min_peak_distance_px,
+        "spot_radius_px": resolved_spot_radius,
+        "background_percentile": background_percentile,
+        "detected_spot_centers_yx": centers.tolist(),
+        "quality_score_components": [
+            "target_plane_uniformity",
+            "mean_spot_sharpness",
+            "inverse_background_halo",
+            "inverse_mean_fwhm_px",
+        ],
+    }
+    parameters.update(run_parameters)
+    _write_json_atomic(
+        output_path / "experimental_parameters.json", parameters
+    )
+    _report(
+        progress_fn,
+        "[done] Analysis complete: "
+        f"best delta_z={float(best['delta_z_mm']):+.3f} mm",
+    )
+    best_result = dict(best)
+    best_result["selection_is_provisional"] = selection_is_provisional
+    return ranked_rows, best_result
 
 
 def run_experimental_scan(
@@ -725,6 +1677,7 @@ def run_experimental_scan(
     monitor_index: int,
     camera_index: int,
     sleep_fn=time.sleep,
+    progress_fn: ProgressFn = print,
 ) -> tuple[
     list[dict[str, float | str | bool]], dict[str, float | str | bool]
 ]:
@@ -748,90 +1701,120 @@ def run_experimental_scan(
         save_raw_frames=save_raw_frames,
         saturation_level=saturation_level,
         sleep_fn=sleep_fn,
+        progress_fn=progress_fn,
     )
-    centers = detect_common_spots(
-        [result.average for result in acquired],
-        expected_spots,
-        roi_xywh=roi_xywh,
-        min_peak_distance_px=min_peak_distance_px,
-        background_percentile=background_percentile,
-    )
-    metric_rows, resolved_spot_radius = analyze_acquired_points(
-        acquired,
-        centers,
-        spot_radius_px=spot_radius_px,
-        roi_xywh=roi_xywh,
-        background_percentile=background_percentile,
-    )
-    ranked_rows, best = rank_quality(
-        metric_rows,
-        maximum_saturation_fraction=maximum_saturation_fraction,
-    )
+    try:
+        return _analyze_and_write_results(
+            acquired,
+            Path(output_dir),
+            expected_spots=expected_spots,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            spot_radius_px=spot_radius_px,
+            background_percentile=background_percentile,
+            maximum_saturation_fraction=maximum_saturation_fraction,
+            progress_fn=progress_fn,
+            run_parameters={
+                "analysis_mode": "live_hardware_scan",
+                "mechanics_during_scan": "fixed",
+                "slm_connection": "Windows secondary monitor via slmpy",
+                "monitor_index": monitor_index,
+                "display_transport_shape_xy": list(display_size_xy),
+                "slm_active_shape_xy": list(active_size_xy),
+                "slm_interpolation_applied": False,
+                "correction_bmp": correction_name,
+                "lut": lut,
+                "camera_backend": "Allied Vision Vimba X / vmbpy",
+                "camera_index": camera_index,
+                "exposure_us": exposure_us,
+                "frames_per_point": frames_per_point,
+                "settle_seconds": settle_seconds,
+                "save_raw_frames": save_raw_frames,
+                "saturation_level": saturation_level,
+            },
+        )
+    finally:
+        _close_acquired_memmaps(acquired)
 
-    output_path = Path(output_dir)
-    _write_experimental_metrics(ranked_rows, output_path)
-    _write_experimental_plot(
-        ranked_rows, output_path / "experimental_metrics_vs_delta_z.png"
-    )
-    _write_spot_overlay(
-        acquired,
-        centers,
-        resolved_spot_radius,
-        output_path / "detected_spots.png",
-    )
-    best_payload = {
-        "delta_z_mm": float(best["delta_z_mm"]),
-        "scan_label": str(best["scan_label"]),
-        "quality_score": float(best["quality_score"]),
-        "selection": (
-            "Highest equal-weight scan-normalized score from uniformity, "
-            "spot sharpness, inverse halo, and inverse FWHM among "
-            "unsaturated points."
-        ),
-    }
-    (output_path / "best_delta_z.json").write_text(
-        json.dumps(best_payload, indent=2), encoding="utf-8"
-    )
 
-    scan_directory = points[0].bmp_path.parent
-    parameters = {
-        "created_utc": datetime.now(timezone.utc).isoformat(),
-        "source_scan_directory": str(scan_directory.resolve()),
-        "source_scan_parameters": _load_source_scan_parameters(scan_directory),
-        "scan_count": len(points),
-        "mechanics_during_scan": "fixed",
-        "slm_connection": "Windows secondary monitor via slmpy",
-        "monitor_index": monitor_index,
-        "display_transport_shape_xy": list(display_size_xy),
-        "slm_active_shape_xy": list(active_size_xy),
-        "slm_interpolation_applied": False,
-        "correction_bmp": correction_name,
-        "lut": lut,
-        "camera_backend": "Allied Vision Vimba X / vmbpy",
-        "camera_index": camera_index,
-        "exposure_us": exposure_us,
-        "frames_per_point": frames_per_point,
-        "settle_seconds": settle_seconds,
-        "save_raw_frames": save_raw_frames,
-        "saturation_level": saturation_level,
-        "maximum_saturation_fraction": maximum_saturation_fraction,
-        "camera_roi_xywh": list(roi_xywh) if roi_xywh is not None else None,
-        "expected_spots": expected_spots,
-        "min_peak_distance_px": min_peak_distance_px,
-        "spot_radius_px": resolved_spot_radius,
-        "background_percentile": background_percentile,
-        "detected_spot_centers_yx": centers.tolist(),
-        "quality_score_components": [
-            "target_plane_uniformity",
-            "mean_spot_sharpness",
-            "inverse_background_halo",
-            "inverse_mean_fwhm_px",
-        ],
-    }
-    (output_path / "experimental_parameters.json").write_text(
-        json.dumps(parameters, indent=2), encoding="utf-8"
+def _common_acquisition_value(
+    acquired: Sequence[AcquiredPoint], attribute: str
+) -> object:
+    values = [getattr(result, attribute) for result in acquired]
+    first = values[0]
+    if all(
+        (value is None and first is None)
+        or (value is not None and first is not None and value == first)
+        for value in values
+    ):
+        return first
+    return "mixed_or_unknown"
+
+
+def run_existing_analysis(
+    points: list[ScanPoint],
+    acquisition_dir: str | Path,
+    *,
+    saturation_level: float | None,
+    expected_spots: int,
+    roi_xywh: tuple[int, int, int, int] | None,
+    min_peak_distance_px: int,
+    spot_radius_px: float | None,
+    background_percentile: float,
+    maximum_saturation_fraction: float,
+    progress_fn: ProgressFn = print,
+) -> tuple[
+    list[dict[str, float | str | bool]], dict[str, float | str | bool]
+]:
+    """Analyze already saved NPY averages without opening SLM or camera."""
+    output_path = Path(acquisition_dir)
+    acquired = load_existing_acquired_points(
+        points,
+        output_path,
+        saturation_level=saturation_level,
+        progress_fn=progress_fn,
     )
-    return ranked_rows, best
+    recovered_exposure = _common_acquisition_value(
+        acquired, "acquisition_exposure_us"
+    )
+    recovered_frame_count = _common_acquisition_value(
+        acquired, "acquisition_frames_per_point"
+    )
+    recovered_saturation_level = _common_acquisition_value(
+        acquired, "effective_saturation_level"
+    )
+    try:
+        return _analyze_and_write_results(
+            acquired,
+            output_path,
+            expected_spots=expected_spots,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            spot_radius_px=spot_radius_px,
+            background_percentile=background_percentile,
+            maximum_saturation_fraction=maximum_saturation_fraction,
+            progress_fn=progress_fn,
+            run_parameters={
+                "analysis_mode": "existing_averages",
+                "mechanics_during_analysis": "not touched",
+                "slm_connection": None,
+                "monitor_index": None,
+                "camera_backend": None,
+                "camera_index": None,
+                "exposure_us": recovered_exposure,
+                "frames_per_point": recovered_frame_count,
+                "settle_seconds": None,
+                "correction_bmp": None,
+                "lut": None,
+                "saturation_level": (
+                    saturation_level
+                    if saturation_level is not None
+                    else recovered_saturation_level
+                ),
+            },
+        )
+    finally:
+        _close_acquired_memmaps(acquired)
 
 
 class SecondaryMonitorSLM:
@@ -869,6 +1852,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scan-dir", default="delta_z_scan_outputs")
     parser.add_argument("--output-dir", default="delta_z_experiment")
+    parser.add_argument(
+        "--analyze-existing",
+        metavar="ACQUISITION_DIR",
+        help=(
+            "Analyze camera_average_*.npy files from an interrupted or "
+            "completed acquisition without opening the SLM or camera."
+        ),
+    )
     parser.add_argument("--monitor", type=int, default=1)
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--exposure-us", type=float, default=50.0)
@@ -930,6 +1921,20 @@ def _expected_spots_from_scan(
     return expected_spots
 
 
+def _print_best_result(best: dict[str, float | str | bool]) -> None:
+    provisional = bool(best.get("selection_is_provisional", False))
+    prefix = "Provisional best delta_z" if provisional else "Best measured delta_z"
+    print(
+        f"{prefix}: {float(best['delta_z_mm']):+.3f} mm "
+        f"(quality score {float(best['quality_score']):.4f})"
+    )
+    if provisional:
+        print(
+            "WARNING: raw-frame saturation data were unavailable; check "
+            "the images for clipping before accepting this delta_z."
+        )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     points = load_scan_points(args.scan_dir)
@@ -937,6 +1942,22 @@ def main(argv: list[str] | None = None) -> None:
     expected_spots = _expected_spots_from_scan(
         scan_directory, args.expected_spots
     )
+    roi_xywh = tuple(args.roi) if args.roi is not None else None
+
+    if args.analyze_existing is not None:
+        _, best = run_existing_analysis(
+            points,
+            args.analyze_existing,
+            saturation_level=args.saturation_level,
+            expected_spots=expected_spots,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=args.min_peak_distance_px,
+            spot_radius_px=args.spot_radius_px,
+            background_percentile=args.background_percentile,
+            maximum_saturation_fraction=args.maximum_saturation_fraction,
+        )
+        _print_best_result(best)
+        return
 
     correction = None
     correction_name = None
@@ -969,7 +1990,7 @@ def main(argv: list[str] | None = None) -> None:
             save_raw_frames=args.save_raw_frames,
             saturation_level=args.saturation_level,
             expected_spots=expected_spots,
-            roi_xywh=tuple(args.roi) if args.roi is not None else None,
+            roi_xywh=roi_xywh,
             min_peak_distance_px=args.min_peak_distance_px,
             spot_radius_px=args.spot_radius_px,
             background_percentile=args.background_percentile,
@@ -977,11 +1998,7 @@ def main(argv: list[str] | None = None) -> None:
             monitor_index=args.monitor,
             camera_index=args.camera_index,
         )
-    print(
-        "Best measured delta_z: "
-        f"{float(best['delta_z_mm']):+.3f} mm "
-        f"(quality score {float(best['quality_score']):.4f})"
-    )
+    _print_best_result(best)
 
 
 if __name__ == "__main__":

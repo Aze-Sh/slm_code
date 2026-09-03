@@ -191,6 +191,13 @@ def test_acquisition_displays_in_order_averages_frames_and_saves_outputs(
     for result in acquired:
         assert result.average_npy.is_file()
         assert result.average_tiff.is_file()
+        assert result.average.dtype == np.float32
+        assert isinstance(result.average, np.memmap)
+        with Image.open(result.average_tiff) as image:
+            assert image.mode == "L"
+        assert (
+            output_dir / f"camera_preview_{result.point.scan_label}.png"
+        ).is_file()
         assert result.raw_frames_npy is not None
         assert result.raw_frames_npy.is_file()
     np.testing.assert_array_equal(
@@ -224,6 +231,94 @@ def test_acquisition_rejects_mismatched_camera_shapes(scan_module, tmp_path):
             save_raw_frames=False,
             sleep_fn=lambda _: None,
         )
+
+
+def test_failed_raw_acquisition_never_exposes_partial_stack(
+    scan_module, tmp_path
+):
+    points = _make_scan_points(scan_module, tmp_path)[:1]
+    output_dir = tmp_path / "failed_raw"
+    camera = FakeCamera(
+        [np.zeros((4, 4), dtype=np.uint8), np.zeros((5, 4), dtype=np.uint8)]
+    )
+
+    with pytest.raises(ValueError, match="camera frame shape changed"):
+        scan_module.acquire_scan_points(
+            points,
+            FakeDisplay((8, 4)),
+            camera,
+            output_dir,
+            exposure_us=50,
+            frames_per_point=2,
+            settle_seconds=0,
+            correction=None,
+            lut=256,
+            save_raw_frames=True,
+            sleep_fn=lambda _: None,
+            progress_fn=None,
+        )
+
+    assert not list(output_dir.glob("camera_raw_*.npy"))
+    assert not list(output_dir.glob(".*.tmp.npy"))
+
+
+def test_exact_stats_are_committed_before_preview_generation(
+    scan_module, tmp_path, monkeypatch
+):
+    points = _make_scan_points(scan_module, tmp_path)[:1]
+    point = points[0]
+    output_dir = tmp_path / "preview_failure"
+
+    def fail_preview(*args, **kwargs):
+        raise OSError("preview disk failure")
+
+    monkeypatch.setattr(scan_module, "_save_preview_png", fail_preview)
+    with pytest.raises(OSError, match="preview disk failure"):
+        scan_module.acquire_scan_points(
+            points,
+            FakeDisplay((8, 4)),
+            FakeCamera([np.array([[0, 255]], dtype=np.uint8)]),
+            output_dir,
+            exposure_us=50,
+            frames_per_point=1,
+            settle_seconds=0,
+            correction=None,
+            lut=256,
+            save_raw_frames=True,
+            saturation_level=255,
+            sleep_fn=lambda _: None,
+            progress_fn=None,
+        )
+
+    assert (output_dir / f"camera_average_{point.scan_label}.npy").is_file()
+    assert (output_dir / f"camera_raw_{point.scan_label}.npy").is_file()
+    assert (output_dir / f"camera_stats_{point.scan_label}.json").is_file()
+
+
+def test_acquisition_preserves_uint16_camera_tiff_range(scan_module, tmp_path):
+    points = _make_scan_points(scan_module, tmp_path)[:1]
+    source = np.array([[0, 4095], [1024, 2048]], dtype=np.uint16)
+
+    acquired = scan_module.acquire_scan_points(
+        points,
+        FakeDisplay((8, 4)),
+        FakeCamera([source]),
+        tmp_path / "uint16_experiment",
+        exposure_us=50,
+        frames_per_point=1,
+        settle_seconds=0,
+        correction=None,
+        lut=256,
+        save_raw_frames=False,
+        saturation_level=4095,
+        sleep_fn=lambda _: None,
+        progress_fn=None,
+    )
+
+    with Image.open(acquired[0].average_tiff) as image:
+        assert image.mode in {"I;16", "I"}
+        assert np.asarray(image).max() == 4095
+    assert acquired[0].saturation_fraction == pytest.approx(0.25)
 
 
 @pytest.mark.parametrize("frames", [0, -1])
@@ -358,6 +453,29 @@ def test_common_spots_and_metrics_prefer_sharp_uniform_low_halo_image(
     assert best["delta_z_mm"] == pytest.approx(0.0)
 
 
+def test_analysis_does_not_allocate_full_coordinate_grids(
+    scan_module, tmp_path, monkeypatch
+):
+    centers = np.array([[20, 20], [20, 44], [44, 20], [44, 44]])
+    image = _gaussian_grid(
+        (64, 64), centers, sigma=1.2, amplitudes=[100] * 4
+    )
+    acquired = _acquired_from_images(scan_module, tmp_path, [image])
+
+    def reject_indices(*args, **kwargs):
+        raise AssertionError("analysis must not allocate full x/y grids")
+
+    monkeypatch.setattr(np, "indices", reject_indices)
+    rows, _ = scan_module.analyze_acquired_points(
+        acquired,
+        centers,
+        spot_radius_px=6,
+        background_percentile=5,
+    )
+
+    assert len(rows) == 1
+
+
 def test_common_spot_detection_respects_camera_roi(scan_module):
     image = np.zeros((60, 80), dtype=np.float64)
     image[10, 10] = 1000
@@ -373,6 +491,50 @@ def test_common_spot_detection_respects_camera_roi(scan_module):
     )
 
     np.testing.assert_array_equal(centers, np.array([[30, 40], [30, 55]]))
+
+
+def test_common_spot_detection_crops_before_background_work(
+    scan_module, monkeypatch
+):
+    image = np.zeros((600, 800), dtype=np.float32)
+    image[230, 340] = 100
+    seen_shapes = []
+    original = scan_module._background_correct
+
+    def recording_background(image_arg, percentile):
+        seen_shapes.append(tuple(np.asarray(image_arg).shape))
+        return original(image_arg, percentile)
+
+    monkeypatch.setattr(
+        scan_module, "_background_correct", recording_background
+    )
+
+    centers = scan_module.detect_common_spots(
+        [image],
+        expected_count=1,
+        roi_xywh=(300, 200, 100, 80),
+        min_peak_distance_px=5,
+        background_percentile=0,
+    )
+
+    np.testing.assert_array_equal(centers, np.array([[230, 340]]))
+    assert seen_shapes == [(80, 100)]
+
+
+def test_spot_windows_scale_with_roi_and_radius_not_camera_frame(scan_module):
+    centers = np.array([[2020, 3020], [2040, 3040]])
+
+    target_mask, windows, origin_yx = scan_module._build_spot_windows(
+        (4036, 5024),
+        centers,
+        radius=6,
+        roi_xywh=(3000, 2000, 100, 80),
+    )
+
+    assert target_mask.shape == (80, 100)
+    assert origin_yx == (2000, 3000)
+    assert len(windows) == 2
+    assert all(window.mask.size <= 13 * 13 for window in windows)
 
 
 def test_quality_ranking_excludes_saturated_scan_point(scan_module):
@@ -436,6 +598,7 @@ def test_cli_defaults_match_the_working_vimba_notebook(scan_module):
     assert args.lut == 224
     assert args.no_calibration is False
     assert args.save_raw_frames is False
+    assert args.analyze_existing is None
     assert "wx" not in sys.modules
     assert "vmbpy" not in sys.modules
 
@@ -458,6 +621,8 @@ def test_cli_parses_analysis_and_raw_frame_options(scan_module):
             "8.5",
             "--saturation-level",
             "255",
+            "--analyze-existing",
+            "delta_z_experiment_test",
         ]
     )
 
@@ -468,6 +633,53 @@ def test_cli_parses_analysis_and_raw_frame_options(scan_module):
     assert args.min_peak_distance_px == 12
     assert args.spot_radius_px == pytest.approx(8.5)
     assert args.saturation_level == pytest.approx(255)
+    assert args.analyze_existing == "delta_z_experiment_test"
+
+
+def test_cli_existing_analysis_does_not_touch_hardware(
+    scan_module, tmp_path, monkeypatch
+):
+    points = _make_scan_points(scan_module, tmp_path)
+    _write_scan_manifest(
+        tmp_path,
+        [
+            {
+                "delta_z_mm": point.delta_z_mm,
+                "bmp_file": point.bmp_path.name,
+            }
+            for point in points
+        ],
+    )
+    acquisition_dir = tmp_path / "existing"
+    acquisition_dir.mkdir()
+    calls = []
+
+    def fake_existing(points_arg, directory_arg, **kwargs):
+        calls.append((points_arg, directory_arg, kwargs))
+        return [], {"delta_z_mm": -5.0, "quality_score": 0.75}
+
+    def reject_hardware(*args, **kwargs):
+        raise AssertionError("offline analysis must not initialize hardware")
+
+    monkeypatch.setattr(scan_module, "run_existing_analysis", fake_existing)
+    monkeypatch.setattr(scan_module, "_resolve_correction_path", reject_hardware)
+    monkeypatch.setattr(scan_module, "SecondaryMonitorSLM", reject_hardware)
+
+    scan_module.main(
+        [
+            "--scan-dir",
+            str(tmp_path),
+            "--analyze-existing",
+            str(acquisition_dir),
+            "--expected-spots",
+            "4",
+            "--saturation-level",
+            "255",
+        ]
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1] == str(acquisition_dir)
 
 
 def test_full_experimental_scan_writes_metrics_plots_and_best_delta_z(
@@ -534,3 +746,234 @@ def test_full_experimental_scan_writes_metrics_plots_and_best_delta_z(
     assert parameters["slm_active_shape_xy"] == [6, 4]
     assert parameters["exposure_us"] == pytest.approx(50)
     assert parameters["frames_per_point"] == 1
+
+
+def test_load_existing_averages_uses_memory_maps_and_requires_all_points(
+    scan_module, tmp_path
+):
+    points = _make_scan_points(scan_module, tmp_path)
+    acquisition_dir = tmp_path / "existing"
+    acquisition_dir.mkdir()
+    arrays = [
+        np.array([[0, 255], [5, 10]], dtype=np.float32),
+        np.array([[1, 2], [3, 4]], dtype=np.float32),
+    ]
+    for point, array in zip(points, arrays):
+        np.save(
+            acquisition_dir / f"camera_average_{point.scan_label}.npy",
+            array,
+        )
+
+    acquired = scan_module.load_existing_acquired_points(
+        points,
+        acquisition_dir,
+        saturation_level=255,
+        progress_fn=None,
+    )
+
+    assert all(isinstance(result.average, np.memmap) for result in acquired)
+    assert acquired[0].peak_raw == pytest.approx(255)
+    assert acquired[0].saturation_fraction == pytest.approx(0.25)
+    assert acquired[1].saturation_fraction == pytest.approx(0)
+
+    missing_dir = tmp_path / "missing"
+    missing_dir.mkdir()
+    np.save(
+        missing_dir / f"camera_average_{points[0].scan_label}.npy",
+        arrays[0],
+    )
+    with pytest.raises(FileNotFoundError, match=points[1].scan_label):
+        scan_module.load_existing_acquired_points(
+            points,
+            missing_dir,
+            saturation_level=255,
+            progress_fn=None,
+        )
+
+
+def test_existing_loader_uses_exact_acquisition_sidecar(scan_module, tmp_path):
+    points = _make_scan_points(scan_module, tmp_path)[:1]
+    acquisition_dir = tmp_path / "existing_with_stats"
+    acquisition_dir.mkdir()
+    point = points[0]
+    np.save(
+        acquisition_dir / f"camera_average_{point.scan_label}.npy",
+        np.array([[0, 100], [5, 10]], dtype=np.float32),
+    )
+    (acquisition_dir / f"camera_stats_{point.scan_label}.json").write_text(
+        json.dumps(
+            {
+                "scan_label": point.scan_label,
+                "delta_z_mm": point.delta_z_mm,
+                "frame_dtype": "uint8",
+                "frame_shape_yx": [2, 2],
+                "frames_per_point": 8,
+                "exposure_us": 50,
+                "effective_saturation_level": 255,
+                "peak_raw": 255,
+                "saturation_fraction": 0.125,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    acquired = scan_module.load_existing_acquired_points(
+        points,
+        acquisition_dir,
+        saturation_level=None,
+        progress_fn=None,
+    )
+
+    assert acquired[0].peak_raw == pytest.approx(255)
+    assert acquired[0].saturation_fraction == pytest.approx(0.125)
+    assert acquired[0].saturation_fraction_is_exact is True
+    assert acquired[0].saturation_fraction_source == "acquisition_sidecar"
+    assert acquired[0].acquisition_exposure_us == pytest.approx(50)
+    assert acquired[0].acquisition_frames_per_point == 8
+
+
+def test_raw_recovery_prefers_saved_sensor_saturation_level(
+    scan_module, tmp_path
+):
+    points = _make_scan_points(scan_module, tmp_path)[:1]
+    point = points[0]
+    acquisition_dir = tmp_path / "raw_with_stats"
+    acquisition_dir.mkdir()
+    raw = np.array(
+        [
+            [[0, 4095], [10, 20]],
+            [[4095, 100], [10, 20]],
+        ],
+        dtype=np.uint16,
+    )
+    np.save(
+        acquisition_dir / f"camera_average_{point.scan_label}.npy",
+        raw.mean(axis=0, dtype=np.float32),
+    )
+    np.save(acquisition_dir / f"camera_raw_{point.scan_label}.npy", raw)
+    (acquisition_dir / f"camera_stats_{point.scan_label}.json").write_text(
+        json.dumps(
+            {
+                "scan_label": point.scan_label,
+                "delta_z_mm": point.delta_z_mm,
+                "frame_dtype": "uint16",
+                "frame_shape_yx": [2, 2],
+                "frames_per_point": 2,
+                "exposure_us": 50,
+                "effective_saturation_level": 4095,
+                "peak_raw": 4095,
+                "saturation_fraction": 0.25,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    acquired = scan_module.load_existing_acquired_points(
+        points,
+        acquisition_dir,
+        saturation_level=None,
+        progress_fn=None,
+    )
+
+    assert acquired[0].saturation_fraction == pytest.approx(0.25)
+    assert acquired[0].effective_saturation_level == pytest.approx(4095)
+    assert acquired[0].saturation_fraction_is_exact is True
+
+
+def test_existing_analysis_closes_memmaps_after_failure(
+    scan_module, tmp_path, monkeypatch
+):
+    points = _make_scan_points(scan_module, tmp_path)
+    acquisition_dir = tmp_path / "failed_analysis"
+    acquisition_dir.mkdir()
+    for point in points:
+        np.save(
+            acquisition_dir / f"camera_average_{point.scan_label}.npy",
+            np.ones((16, 16), dtype=np.float32),
+        )
+    captured = []
+    original_loader = scan_module.load_existing_acquired_points
+
+    def recording_loader(*args, **kwargs):
+        results = original_loader(*args, **kwargs)
+        captured.extend(results)
+        return results
+
+    def fail_detection(*args, **kwargs):
+        raise RuntimeError("intentional detection failure")
+
+    monkeypatch.setattr(
+        scan_module, "load_existing_acquired_points", recording_loader
+    )
+    monkeypatch.setattr(scan_module, "detect_common_spots", fail_detection)
+
+    with pytest.raises(RuntimeError, match="intentional"):
+        scan_module.run_existing_analysis(
+            points,
+            acquisition_dir,
+            saturation_level=255,
+            expected_spots=4,
+            roi_xywh=None,
+            min_peak_distance_px=8,
+            spot_radius_px=6,
+            background_percentile=5,
+            maximum_saturation_fraction=0.001,
+            progress_fn=None,
+        )
+
+    assert captured
+    assert all(result.average._mmap.closed for result in captured)
+
+
+def test_existing_scan_analysis_writes_results_without_hardware(
+    scan_module, tmp_path
+):
+    points = _make_scan_points(scan_module, tmp_path)
+    centers = np.array([[20, 20], [20, 44], [44, 20], [44, 44]])
+    sharp = _gaussian_grid(
+        (64, 64), centers, sigma=1.2, amplitudes=[100] * 4
+    ).astype(np.float32)
+    blurred = _gaussian_grid(
+        (64, 64), centers, sigma=3.2, amplitudes=[100, 80, 60, 40]
+    ).astype(np.float32)
+    acquisition_dir = tmp_path / "existing"
+    acquisition_dir.mkdir()
+    for point, array in zip(points, [sharp, blurred]):
+        np.save(
+            acquisition_dir / f"camera_average_{point.scan_label}.npy",
+            array,
+        )
+
+    rows, best = scan_module.run_existing_analysis(
+        points,
+        acquisition_dir,
+        saturation_level=255,
+        expected_spots=4,
+        roi_xywh=None,
+        min_peak_distance_px=8,
+        spot_radius_px=6,
+        background_percentile=5,
+        maximum_saturation_fraction=0.001,
+        progress_fn=None,
+    )
+
+    assert len(rows) == 2
+    assert best["delta_z_mm"] == pytest.approx(-5.0)
+    assert (acquisition_dir / "experimental_metrics.csv").is_file()
+    assert (acquisition_dir / "best_delta_z.json").is_file()
+    assert (acquisition_dir / "detected_spots.png").is_file()
+    assert len(list(acquisition_dir.glob("camera_preview_*.png"))) == 2
+    with (acquisition_dir / "experimental_parameters.json").open(
+        encoding="utf-8"
+    ) as handle:
+        parameters = json.load(handle)
+    assert parameters["analysis_mode"] == "existing_averages"
+    assert (
+        parameters["saturation_fraction_source"]
+        == "average_threshold_estimate"
+    )
+    with (acquisition_dir / "best_delta_z.json").open(
+        encoding="utf-8"
+    ) as handle:
+        best_payload = json.load(handle)
+    assert best_payload["selection_is_provisional"] is True

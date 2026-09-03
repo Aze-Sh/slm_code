@@ -212,6 +212,32 @@ SLM 序列号不是 `LSH0804730`，不要使用这张 correction，应换成当�
 反向 halo、反向 FWHM。它用于快速排序；最终选择时仍应同时查看原始 CCD 图、
 `detected_spots.png` 和各条独立指标。过曝点不会被自动推荐。
 
+### 把已经拍摄的结果拼成一张对比图
+
+成功分析后，可以完全离线运行：
+
+```powershell
+.\.venv\Scripts\python.exe .\make_delta_z_montage.py `
+  .\delta_z_experiment_23us_v5
+```
+
+把最后一个参数替换成实际实验输出目录。脚本从
+`experimental_parameters.json` 自动读取拍摄时使用的 ROI 和共同 64 点中心，
+不会连接 SLM 或相机，也不会重新拍照。它以流式方式读取大型 NPY，并在同一个
+实验目录中生成：
+
+- `delta_z_full_array_montage.png`：所有阵列使用同一线性灰度尺度，适合比较
+  亮度、均匀性和背景；
+- `delta_z_median_spot_montage.png`：每个扫描点将 64 个光斑对准、峰值归一化后
+  取像素中位数，适合比较主峰宽度；
+- `delta_z_median_spot_log_montage.png`：同一典型光斑的 `-30` 至 `0 dB` 显示，
+  适合观察弱圆环和 halo。
+
+完整阵列图不能逐图自动拉伸；典型光斑图只用于比较形状，不能比较绝对功率。
+运行前应先查看 `detected_spots.png`，确认共同 64 点没有把中央零级光误认为目标
+光斑。若旧结果还没有 `experimental_parameters.json`，先按下一节使用
+`--analyze-existing` 补完分析。
+
 ### 已拍完 9 张但分析卡住或电脑重启
 
 只要实验目录中的 9 个 `camera_average_*.npy` 都存在，就不需要再次连接或操作

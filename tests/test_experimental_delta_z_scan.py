@@ -375,6 +375,18 @@ def _gaussian_grid(shape, centers, sigma, amplitudes, background=2.0):
     return image
 
 
+def _single_spot(shape, center, sigma_y, sigma_x):
+    y, x = np.indices(shape, dtype=np.float64)
+    center_y, center_x = center
+    return np.exp(
+        -0.5
+        * (
+            ((y - center_y) / sigma_y) ** 2
+            + ((x - center_x) / sigma_x) ** 2
+        )
+    )
+
+
 def _acquired_from_images(scan_module, tmp_path, images, saturation=None):
     results = []
     saturation = saturation or [0.0] * len(images)
@@ -451,6 +463,63 @@ def test_common_spots_and_metrics_prefer_sharp_uniform_low_halo_image(
         "quality_score"
     ]
     assert best["delta_z_mm"] == pytest.approx(0.0)
+
+
+def test_gaussian_similarity_and_circularity_separate_shape_failures(
+    scan_module,
+):
+    shape = (31, 31)
+    center = (15, 15)
+    y, x = np.indices(shape, dtype=np.float64)
+    mask = (y - center[0]) ** 2 + (x - center[1]) ** 2 <= 15**2
+    round_gaussian = _single_spot(shape, center, 2.5, 2.5)
+    elliptical_gaussian = _single_spot(shape, center, 5.0, 2.0)
+    radius = np.hypot(y - center[0], x - center[1])
+    ring = np.exp(-0.5 * ((radius - 5.0) / 0.9) ** 2)
+
+    round_metrics = scan_module._gaussian_round_metrics(
+        round_gaussian, mask, 0, 0, *center
+    )
+    elliptical_metrics = scan_module._gaussian_round_metrics(
+        elliptical_gaussian, mask, 0, 0, *center
+    )
+    ring_metrics = scan_module._gaussian_round_metrics(
+        ring, mask, 0, 0, *center
+    )
+
+    assert round_metrics.gaussian_similarity > 0.99
+    assert round_metrics.circularity > 0.99
+    # Ellipticity is not counted twice: it remains a good Gaussian fit but
+    # receives a low, separate sigma_minor/sigma_major score.
+    assert elliptical_metrics.gaussian_similarity > 0.98
+    assert elliptical_metrics.circularity < 0.5
+    # A circular ring remains circular but is not Gaussian.
+    assert ring_metrics.circularity > 0.99
+    assert ring_metrics.gaussian_similarity < 0.5
+
+
+def test_missing_spot_has_finite_zero_shape_score_and_does_not_abort(
+    scan_module, tmp_path
+):
+    image = np.zeros((48, 48), dtype=np.float64)
+    image[2, 2] = 100.0  # signal exists, but not in the expected spot window
+    acquired = _acquired_from_images(scan_module, tmp_path, [image])
+
+    rows, _ = scan_module.analyze_acquired_points(
+        acquired,
+        np.asarray([[24, 24]]),
+        spot_radius_px=6,
+        background_percentile=0,
+    )
+    ranked, best = scan_module.rank_quality(rows)
+
+    assert rows[0]["valid_spot_fraction"] == pytest.approx(0.0)
+    assert rows[0]["mean_gaussian_similarity"] == pytest.approx(0.0)
+    assert rows[0]["mean_spot_circularity"] == pytest.approx(0.0)
+    assert rows[0]["gaussian_roundness_score"] == pytest.approx(0.0)
+    assert np.isfinite(float(rows[0]["mean_fwhm_px"]))
+    assert ranked[0]["quality_score"] == pytest.approx(0.0)
+    assert best["quality_score"] == pytest.approx(0.0)
 
 
 def test_analysis_does_not_allocate_full_coordinate_grids(

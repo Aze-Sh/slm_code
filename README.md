@@ -205,12 +205,23 @@ SLM 序列号不是 `LSH0804730`，不要使用这张 correction，应换成当�
 - `mean_fwhm_px`：平均等效 FWHM，越低越清晰；
 - `mean_encircled_energy_radius_50_px`：50% 包围能量半径，越低越集中；
 - `mean_spot_sharpness`：光斑能量集中度，越高越好；
+- `mean_gaussian_similarity`：每个光斑与“同质心、同协方差”的最佳二维椭圆
+  Gaussian 的拟合相似度平均值，范围 0–1；圆环、拖尾和多峰会降低它；
+- `mean_spot_circularity`：强度二阶矩的
+  `sigma_minor/sigma_major` 平均值，范围 0–1，越接近 1 越圆；
+- `gaussian_roundness_score`：逐光斑
+  `gaussian_similarity × circularity` 后对全部预期光斑取平均；低于本图最亮
+  光斑积分强度 1% 的弱/缺失光斑按 0 分计；
+- `valid_spot_fraction`：能够可靠拟合形状的光斑比例；
 - `saturation_fraction`：过曝像素比例；
 - centroid、peak 及其偏移。
 
-`quality_score` 对以下四项做本轮扫描内的归一化并等权平均：均匀性、sharpness、
-反向 halo、反向 FWHM。它用于快速排序；最终选择时仍应同时查看原始 CCD 图、
-`detected_spots.png` 和各条独立指标。过曝点不会被自动推荐。
+新分析中的 `quality_score` 就等于 `gaussian_roundness_score`，是可跨扫描比较的
+绝对 0–1 形状分数，不再由均匀性、halo、sharpness 或 FWHM 的本轮相对排名决定。
+Gaussian 相似度允许椭圆 Gaussian 本身得到高拟合度，再由 circularity 单独惩罚
+椭圆，因此不会把椭圆重复扣分；圆形但带圆环的光斑则会在 Gaussian 相似度上
+明显扣分。均匀性、halo、FWHM 等旧指标仍完整保留在 CSV 中供独立检查。过曝点
+不会被自动推荐，最终选择仍应同时查看原始 CCD 图和拼图。
 
 ### 把已经拍摄的结果拼成一张对比图
 

@@ -63,6 +63,26 @@ class _SpotWindow:
 
 
 @dataclass(frozen=True)
+class _GaussianRoundMetrics:
+    """Shape-only measurements for one background-corrected spot.
+
+    ``gaussian_similarity`` is the fraction of the spot's squared signal that
+    is explained by a centroid-aligned Gaussian with the measured covariance.
+    It is therefore bounded by zero and one and is independent of spot power.
+    ``circularity`` is ``sigma_minor / sigma_major`` from the intensity
+    covariance matrix.  A round spot has circularity one.  Fitting an
+    elliptical Gaussian for similarity deliberately separates Gaussian shape
+    fidelity from the circularity penalty.
+    """
+
+    gaussian_similarity: float
+    circularity: float
+    gaussian_sigma_px: float
+    centroid_offset_px: float
+    valid: bool
+
+
+@dataclass(frozen=True)
 class _CameraAverage:
     average: np.ndarray
     frame_dtype: np.dtype
@@ -843,6 +863,111 @@ def _spot_shape_metrics(
     return float(equivalent_fwhm), encircled_energy_radius_50, sharpness
 
 
+def _gaussian_round_metrics(
+    signal_patch: np.ndarray,
+    mask: np.ndarray,
+    global_y_start: int,
+    global_x_start: int,
+    expected_center_y: float,
+    expected_center_x: float,
+) -> _GaussianRoundMetrics:
+    """Compare one spot with a covariance-matched 2-D Gaussian.
+
+    The Gaussian is centered on the spot's intensity centroid and uses the
+    measured 2-D covariance, while its amplitude has the closed-form least-
+    squares fit.  The returned similarity is squared cosine similarity,
+    equivalently the fraction of signal energy explained by that amplitude-
+    scaled model.  A ring or asymmetric tail cannot be represented by this
+    model and consequently loses similarity.  An elliptical but otherwise
+    clean Gaussian keeps high similarity and is penalized once, separately,
+    through circularity.
+
+    Empty, single-pixel, or otherwise unmeasurable spots return finite zero
+    scores.  This lets an experimental scan finish and write its diagnostic
+    images instead of aborting during ranking.
+    """
+    patch = np.asarray(signal_patch, dtype=np.float64)
+    mask_array = np.asarray(mask, dtype=bool)
+    if patch.shape != mask_array.shape:
+        raise ValueError("signal_patch and mask must have the same shape")
+
+    local_y, local_x = np.nonzero(mask_array)
+    values = np.maximum(patch[mask_array], 0.0)
+    invalid = _GaussianRoundMetrics(0.0, 0.0, 0.0, 0.0, False)
+    if values.size == 0:
+        return invalid
+    spot_sum = float(np.sum(values, dtype=np.float64))
+    squared_sum = float(np.dot(values, values))
+    if not np.isfinite(spot_sum) or not np.isfinite(squared_sum):
+        return invalid
+    if spot_sum <= 0.0 or squared_sum <= 0.0:
+        return invalid
+
+    # A lone hot pixel has no measurable two-dimensional shape and must not be
+    # mistaken for a perfect, diffraction-limited Gaussian.
+    effective_pixel_count = spot_sum**2 / squared_sum
+    if effective_pixel_count < 2.0:
+        return invalid
+
+    mask_y = local_y.astype(np.float64) + float(global_y_start)
+    mask_x = local_x.astype(np.float64) + float(global_x_start)
+    centroid_y = float(np.dot(values, mask_y) / spot_sum)
+    centroid_x = float(np.dot(values, mask_x) / spot_sum)
+    delta_y = mask_y - centroid_y
+    delta_x = mask_x - centroid_x
+    variance_y = float(np.dot(values, delta_y * delta_y) / spot_sum)
+    variance_x = float(np.dot(values, delta_x * delta_x) / spot_sum)
+    covariance_xy = float(np.dot(values, delta_y * delta_x) / spot_sum)
+
+    trace = variance_y + variance_x
+    discriminant = float(
+        np.hypot(variance_y - variance_x, 2.0 * covariance_xy)
+    )
+    major_variance = max(0.0, 0.5 * (trace + discriminant))
+    minor_variance = max(0.0, 0.5 * (trace - discriminant))
+    if major_variance <= np.finfo(np.float64).eps:
+        return invalid
+    if minor_variance <= np.finfo(np.float64).eps:
+        return invalid
+    circularity = float(
+        np.clip(np.sqrt(minor_variance / major_variance), 0.0, 1.0)
+    )
+
+    covariance = np.asarray(
+        [[variance_y, covariance_xy], [covariance_xy, variance_x]],
+        dtype=np.float64,
+    )
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    if not np.all(np.isfinite(eigenvalues)) or float(eigenvalues[0]) <= 0.0:
+        return invalid
+    coordinates = np.column_stack((delta_y, delta_x))
+    principal_coordinates = coordinates @ eigenvectors
+    mahalanobis_squared = np.sum(
+        principal_coordinates**2 / eigenvalues[None, :], axis=1
+    )
+    model = np.exp(-0.5 * mahalanobis_squared)
+    model_squared_sum = float(np.dot(model, model))
+    if model_squared_sum <= 0.0:
+        return invalid
+    projection = float(np.dot(values, model))
+    best_similarity = projection**2 / (squared_sum * model_squared_sum)
+    equivalent_sigma = float(np.sqrt(np.sqrt(np.prod(eigenvalues))))
+
+    centroid_offset = float(
+        np.hypot(
+            centroid_y - float(expected_center_y),
+            centroid_x - float(expected_center_x),
+        )
+    )
+    return _GaussianRoundMetrics(
+        gaussian_similarity=float(np.clip(best_similarity, 0.0, 1.0)),
+        circularity=circularity,
+        gaussian_sigma_px=equivalent_sigma,
+        centroid_offset_px=centroid_offset,
+        valid=True,
+    )
+
+
 def analyze_acquired_points(
     acquired: list[AcquiredPoint],
     centers: np.ndarray,
@@ -912,7 +1037,7 @@ def analyze_acquired_points(
         spot_cv = (
             float(np.std(spot_sums) / mean_spot_sum)
             if mean_spot_sum > 0
-            else float("inf")
+            else 1.0
         )
         target_signal = float(
             np.sum(signal[target_mask], dtype=np.float64)
@@ -942,15 +1067,47 @@ def analyze_acquired_points(
             np.hypot(centroid_x - peak_x, centroid_y - peak_y)
         )
 
-        per_spot_metrics = [
-            _spot_shape_metrics(
-                signal[window.y_slice, window.x_slice],
+        # Treat a spot below one percent of the brightest target as missing.
+        # Such a patch contains too little information for a meaningful shape
+        # fit; assigning finite zero shape scores keeps analysis diagnostic and
+        # makes missing spots reduce, rather than crash, the final score.
+        minimum_shape_signal = max(1e-12, 0.01 * maximum_spot_sum)
+        per_spot_metrics = []
+        per_spot_gaussian_metrics = []
+        for spot_sum, (center_y, center_x), window in zip(
+            spot_sums, center_array, spot_windows
+        ):
+            patch = signal[window.y_slice, window.x_slice]
+            if float(spot_sum) < minimum_shape_signal:
+                per_spot_metrics.append((2.0 * radius, radius, 0.0))
+                per_spot_gaussian_metrics.append(
+                    _GaussianRoundMetrics(0.0, 0.0, 0.0, radius, False)
+                )
+                continue
+            legacy_metrics = _spot_shape_metrics(
+                patch,
                 window.mask,
                 window.global_y_start,
                 window.global_x_start,
             )
-            for window in spot_windows
-        ]
+            gaussian_metrics = _gaussian_round_metrics(
+                patch,
+                window.mask,
+                window.global_y_start,
+                window.global_x_start,
+                float(center_y),
+                float(center_x),
+            )
+            if not gaussian_metrics.valid or not all(
+                np.isfinite(value) for value in legacy_metrics
+            ):
+                legacy_metrics = (2.0 * radius, radius, 0.0)
+                gaussian_metrics = _GaussianRoundMetrics(
+                    0.0, 0.0, 0.0, radius, False
+                )
+            per_spot_metrics.append(legacy_metrics)
+            per_spot_gaussian_metrics.append(gaussian_metrics)
+
         mean_fwhm = float(np.mean([metric[0] for metric in per_spot_metrics]))
         mean_radius_50 = float(
             np.mean([metric[1] for metric in per_spot_metrics])
@@ -958,6 +1115,41 @@ def analyze_acquired_points(
         mean_sharpness = float(
             np.mean([metric[2] for metric in per_spot_metrics])
         )
+        gaussian_similarities = np.asarray(
+            [metric.gaussian_similarity for metric in per_spot_gaussian_metrics],
+            dtype=np.float64,
+        )
+        circularities = np.asarray(
+            [metric.circularity for metric in per_spot_gaussian_metrics],
+            dtype=np.float64,
+        )
+        gaussian_round_scores = gaussian_similarities * circularities
+        valid_spot_mask = np.asarray(
+            [metric.valid for metric in per_spot_gaussian_metrics], dtype=bool
+        )
+        valid_spot_fraction = float(np.mean(valid_spot_mask))
+        if np.any(valid_spot_mask):
+            mean_gaussian_sigma = float(
+                np.mean(
+                    [
+                        metric.gaussian_sigma_px
+                        for metric in per_spot_gaussian_metrics
+                        if metric.valid
+                    ]
+                )
+            )
+            mean_spot_center_offset = float(
+                np.mean(
+                    [
+                        metric.centroid_offset_px
+                        for metric in per_spot_gaussian_metrics
+                        if metric.valid
+                    ]
+                )
+            )
+        else:
+            mean_gaussian_sigma = 0.0
+            mean_spot_center_offset = radius
 
         rows.append(
             {
@@ -986,6 +1178,20 @@ def analyze_acquired_points(
                 "mean_fwhm_px": mean_fwhm,
                 "mean_encircled_energy_radius_50_px": mean_radius_50,
                 "mean_spot_sharpness": mean_sharpness,
+                "mean_gaussian_similarity": float(
+                    np.mean(gaussian_similarities)
+                ),
+                "median_gaussian_similarity": float(
+                    np.median(gaussian_similarities)
+                ),
+                "mean_spot_circularity": float(np.mean(circularities)),
+                "median_spot_circularity": float(np.median(circularities)),
+                "gaussian_roundness_score": float(
+                    np.mean(gaussian_round_scores)
+                ),
+                "valid_spot_fraction": valid_spot_fraction,
+                "mean_gaussian_sigma_px": mean_gaussian_sigma,
+                "mean_spot_center_offset_px": mean_spot_center_offset,
             }
         )
         _report(
@@ -997,15 +1203,23 @@ def analyze_acquired_points(
 
 
 def _normalize_metric(values: np.ndarray, *, higher_is_better: bool) -> np.ndarray:
-    if not np.all(np.isfinite(values)):
-        raise ValueError("quality metric contains non-finite values")
-    minimum = float(np.min(values))
-    maximum = float(np.max(values))
+    """Scan-normalize finite values while assigning invalid values zero."""
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.isfinite(values)
+    normalized = np.zeros(values.shape, dtype=np.float64)
+    if not np.any(finite):
+        return normalized
+    minimum = float(np.min(values[finite]))
+    maximum = float(np.max(values[finite]))
     if np.isclose(minimum, maximum):
-        normalized = np.full(values.shape, 0.5, dtype=np.float64)
+        normalized[finite] = 0.5
     else:
-        normalized = (values - minimum) / (maximum - minimum)
-    return normalized if higher_is_better else 1.0 - normalized
+        normalized[finite] = (
+            values[finite] - minimum
+        ) / (maximum - minimum)
+    if not higher_is_better:
+        normalized[finite] = 1.0 - normalized[finite]
+    return normalized
 
 
 def rank_quality(
@@ -1013,35 +1227,56 @@ def rank_quality(
     *,
     maximum_saturation_fraction: float = 0.001,
 ) -> tuple[list[dict[str, float | str | bool]], dict[str, float | str | bool]]:
-    """Add a scan-relative quality score and select the best unsaturated row."""
+    """Select the most Gaussian, circular unsaturated scan point.
+
+    New analyses provide an absolute zero-to-one
+    ``gaussian_roundness_score``.  It is the mean, over every expected spot,
+    of ``gaussian_similarity * circularity``; missing spots contribute zero.
+    A legacy fallback is retained so older saved metric dictionaries can still
+    be ranked and re-opened.
+    """
     if not rows:
         raise ValueError("at least one metric row is required")
     if maximum_saturation_fraction < 0:
         raise ValueError("maximum_saturation_fraction must be non-negative")
 
-    uniformity = np.asarray(
-        [float(row["target_plane_uniformity"]) for row in rows]
-    )
-    sharpness = np.asarray([float(row["mean_spot_sharpness"]) for row in rows])
-    halo = np.asarray([float(row["background_halo"]) for row in rows])
-    fwhm = np.asarray([float(row["mean_fwhm_px"]) for row in rows])
-    components = np.column_stack(
-        [
-            _normalize_metric(uniformity, higher_is_better=True),
-            _normalize_metric(sharpness, higher_is_better=True),
-            _normalize_metric(halo, higher_is_better=False),
-            _normalize_metric(fwhm, higher_is_better=False),
-        ]
-    )
-    quality_scores = np.mean(components, axis=1)
+    if all("gaussian_roundness_score" in row for row in rows):
+        quality_scores = np.asarray(
+            [float(row["gaussian_roundness_score"]) for row in rows],
+            dtype=np.float64,
+        )
+        quality_scores = np.clip(
+            np.nan_to_num(quality_scores, nan=0.0, posinf=0.0, neginf=0.0),
+            0.0,
+            1.0,
+        )
+    else:
+        uniformity = np.asarray(
+            [float(row["target_plane_uniformity"]) for row in rows]
+        )
+        sharpness = np.asarray(
+            [float(row["mean_spot_sharpness"]) for row in rows]
+        )
+        halo = np.asarray([float(row["background_halo"]) for row in rows])
+        fwhm = np.asarray([float(row["mean_fwhm_px"]) for row in rows])
+        components = np.column_stack(
+            [
+                _normalize_metric(uniformity, higher_is_better=True),
+                _normalize_metric(sharpness, higher_is_better=True),
+                _normalize_metric(halo, higher_is_better=False),
+                _normalize_metric(fwhm, higher_is_better=False),
+            ]
+        )
+        quality_scores = np.mean(components, axis=1)
 
     ranked_rows: list[dict[str, float | str | bool]] = []
     eligible = []
     for row, score in zip(rows, quality_scores):
         row_copy: dict[str, float | str | bool] = dict(row)
-        row_is_eligible = (
-            float(row["saturation_fraction"])
-            <= maximum_saturation_fraction
+        saturation_fraction = float(row["saturation_fraction"])
+        row_is_eligible = bool(
+            np.isfinite(saturation_fraction)
+            and saturation_fraction <= maximum_saturation_fraction
         )
         row_copy["quality_score"] = float(score)
         row_copy["eligible_for_best"] = bool(row_is_eligible)
@@ -1077,14 +1312,16 @@ def _write_experimental_plot(
 
     delta_z = np.asarray([float(row["delta_z_mm"]) for row in rows])
     series = (
-        ("quality_score", "Experimental quality score"),
+        ("quality_score", "Gaussian-round quality score (0-1)"),
+        ("mean_gaussian_similarity", "Mean Gaussian similarity (0-1)"),
+        ("mean_spot_circularity", "Mean spot circularity (0-1)"),
         ("target_plane_uniformity", "Spot uniformity (min/max)"),
         ("mean_fwhm_px", "Mean equivalent FWHM (px)"),
         ("background_halo", "Background / halo fraction"),
         ("mean_spot_sharpness", "Mean spot sharpness"),
-        ("saturation_fraction", "Saturated pixel fraction"),
+        ("valid_spot_fraction", "Valid fitted spot fraction"),
     )
-    figure, axes = plt.subplots(3, 2, figsize=(10, 11), sharex=True)
+    figure, axes = plt.subplots(4, 2, figsize=(10, 14), sharex=True)
     for axis, (key, title) in zip(axes.flat, series):
         axis.plot(delta_z, [float(row[key]) for row in rows], "o-")
         axis.set_title(title)
@@ -1596,9 +1833,10 @@ def _analyze_and_write_results(
         "quality_score": float(best["quality_score"]),
         "selection_is_provisional": selection_is_provisional,
         "selection": (
-            "Highest equal-weight scan-normalized score from uniformity, "
-            "spot sharpness, inverse halo, and inverse FWHM among points "
-            "that did not exceed the configured saturation threshold."
+            "Highest absolute mean per-spot Gaussian-round score among points "
+            "that did not exceed the configured saturation threshold. Each "
+            "spot score is covariance-matched Gaussian similarity multiplied "
+            "by intensity-covariance circularity; missing spots score zero."
         ),
     }
     if selection_is_provisional:
@@ -1616,7 +1854,7 @@ def _analyze_and_write_results(
     scan_directory = acquired[0].point.bmp_path.parent
     parameters: dict[str, object] = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
-        "analysis_version": 2,
+        "analysis_version": 3,
         "analysis_memory_strategy": "streamed_float32_roi_local_spot_windows",
         "source_scan_directory": str(scan_directory.resolve()),
         "source_scan_parameters": _load_source_scan_parameters(scan_directory),
@@ -1634,11 +1872,13 @@ def _analyze_and_write_results(
         "background_percentile": background_percentile,
         "detected_spot_centers_yx": centers.tolist(),
         "quality_score_components": [
-            "target_plane_uniformity",
-            "mean_spot_sharpness",
-            "inverse_background_halo",
-            "inverse_mean_fwhm_px",
+            "covariance_matched_gaussian_similarity",
+            "sigma_minor_over_sigma_major_circularity",
         ],
+        "quality_score_definition": (
+            "mean over all expected spots of gaussian_similarity * "
+            "circularity; invalid or <1%-of-brightest spots contribute zero"
+        ),
     }
     parameters.update(run_parameters)
     _write_json_atomic(

@@ -205,8 +205,10 @@ SLM 序列号不是 `LSH0804730`，不要使用这张 correction，应换成当�
 - `mean_fwhm_px`：平均等效 FWHM，越低越清晰；
 - `mean_encircled_energy_radius_50_px`：50% 包围能量半径，越低越集中；
 - `mean_spot_sharpness`：光斑能量集中度，越高越好；
-- `mean_gaussian_similarity`：每个光斑与“同质心、同协方差”的最佳二维椭圆
-  Gaussian 的拟合相似度平均值，范围 0–1；圆环、拖尾和多峰会降低它；
+- `mean_gaussian_similarity`：把每个光斑和“同质心、同协方差”的二维椭圆
+  Gaussian 都归一化为单位总能量后，计算
+  `1 - 0.5 * sum(abs(measured - Gaussian))`。范围 0–1；弱圆环或拖尾会按其
+  所含总能量明确扣分，而不会被高亮中心的强度平方掩盖；
 - `mean_spot_circularity`：强度二阶矩的
   `sigma_minor/sigma_major` 平均值，范围 0–1，越接近 1 越圆；
 - `gaussian_roundness_score`：逐光斑
@@ -216,8 +218,10 @@ SLM 序列号不是 `LSH0804730`，不要使用这张 correction，应换成当�
 - `saturation_fraction`：过曝像素比例；
 - centroid、peak 及其偏移。
 
-新分析中的 `quality_score` 就等于 `gaussian_roundness_score`，是可跨扫描比较的
-绝对 0–1 形状分数，不再由均匀性、halo、sharpness 或 FWHM 的本轮相对排名决定。
+新分析中的 `quality_score` 就等于 `gaussian_roundness_score`，是绝对 0–1
+形状分数，不再由均匀性、halo、sharpness 或 FWHM 的本轮相对排名决定。在相同
+CCD 像素尺度、光斑 ROI、背景算法并且信噪比足够、未饱和时，它可以跨扫描比较；
+改变成像倍率、ROI 或信噪比后不应直接比较数值。
 Gaussian 相似度允许椭圆 Gaussian 本身得到高拟合度，再由 circularity 单独惩罚
 椭圆，因此不会把椭圆重复扣分；圆形但带圆环的光斑则会在 Gaussian 相似度上
 明显扣分。均匀性、halo、FWHM 等旧指标仍完整保留在 CSV 中供独立检查。过曝点

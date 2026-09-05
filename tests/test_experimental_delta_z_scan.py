@@ -498,6 +498,80 @@ def test_gaussian_similarity_and_circularity_separate_shape_failures(
     assert ring_metrics.gaussian_similarity < 0.5
 
 
+def test_gaussian_similarity_penalizes_weak_ring_energy_monotonically(
+    scan_module,
+):
+    shape = (41, 41)
+    center = (20, 20)
+    y, x = np.indices(shape, dtype=np.float64)
+    radius = np.hypot(y - center[0], x - center[1])
+    mask = radius <= 20
+    core = _single_spot(shape, center, 2.5, 2.5)
+    ring = np.exp(-0.5 * ((radius - 7.0) / 0.8) ** 2)
+    core /= np.sum(core[mask])
+    ring /= np.sum(ring[mask])
+
+    similarities = []
+    for ring_fraction in (0.0, 0.05, 0.10, 0.20):
+        image = (1.0 - ring_fraction) * core + ring_fraction * ring
+        metrics = scan_module._gaussian_round_metrics(
+            image, mask, 0, 0, *center
+        )
+        assert metrics.valid
+        assert metrics.circularity > 0.99
+        similarities.append(metrics.gaussian_similarity)
+
+    assert similarities[0] > 0.99
+    assert all(
+        first > second
+        for first, second in zip(similarities, similarities[1:])
+    )
+    # Even a visually weak 5%-energy ring must create a measurable penalty;
+    # 20% ring energy must not still look like an almost-perfect Gaussian.
+    assert similarities[0] - similarities[1] > 0.03
+    assert similarities[3] < 0.90
+
+
+def test_gaussian_round_metrics_are_stable_under_amplitude_scaling(
+    scan_module,
+):
+    shape = (31, 31)
+    center = (15, 15)
+    y, x = np.indices(shape, dtype=np.float64)
+    mask = (y - center[0]) ** 2 + (x - center[1]) ** 2 <= 15**2
+    image = _single_spot(shape, center, 3.5, 2.0)
+
+    reference = scan_module._gaussian_round_metrics(
+        image, mask, 0, 0, *center
+    )
+    scaled = scan_module._gaussian_round_metrics(
+        137.0 * image, mask, 0, 0, *center
+    )
+
+    assert reference.valid and scaled.valid
+    assert scaled.gaussian_similarity == pytest.approx(
+        reference.gaussian_similarity, abs=1e-12
+    )
+    assert scaled.circularity == pytest.approx(
+        reference.circularity, abs=1e-12
+    )
+
+
+def test_flat_background_is_not_mistaken_for_a_round_gaussian(scan_module):
+    shape = (31, 31)
+    center = (15, 15)
+    y, x = np.indices(shape, dtype=np.float64)
+    mask = (y - center[0]) ** 2 + (x - center[1]) ** 2 <= 15**2
+
+    metrics = scan_module._gaussian_round_metrics(
+        np.full(shape, 7.0), mask, 0, 0, *center
+    )
+
+    assert metrics.valid is False
+    assert metrics.gaussian_similarity == pytest.approx(0.0)
+    assert metrics.circularity == pytest.approx(0.0)
+
+
 def test_missing_spot_has_finite_zero_shape_score_and_does_not_abort(
     scan_module, tmp_path
 ):

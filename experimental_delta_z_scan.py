@@ -66,9 +66,12 @@ class _SpotWindow:
 class _GaussianRoundMetrics:
     """Shape-only measurements for one background-corrected spot.
 
-    ``gaussian_similarity`` is the fraction of the spot's squared signal that
-    is explained by a centroid-aligned Gaussian with the measured covariance.
-    It is therefore bounded by zero and one and is independent of spot power.
+    ``gaussian_similarity`` is one minus the total-variation distance between
+    the spot's energy-normalized intensity and a centroid-aligned Gaussian
+    with the measured covariance.  It is therefore bounded by zero and one,
+    independent of spot power, and makes weak rings/tails count in proportion
+    to the optical energy they contain (instead of being suppressed by an
+    intensity-squared fit).
     ``circularity`` is ``sigma_minor / sigma_major`` from the intensity
     covariance matrix.  A round spot has circularity one.  Fitting an
     elliptical Gaussian for similarity deliberately separates Gaussian shape
@@ -874,13 +877,13 @@ def _gaussian_round_metrics(
     """Compare one spot with a covariance-matched 2-D Gaussian.
 
     The Gaussian is centered on the spot's intensity centroid and uses the
-    measured 2-D covariance, while its amplitude has the closed-form least-
-    squares fit.  The returned similarity is squared cosine similarity,
-    equivalently the fraction of signal energy explained by that amplitude-
-    scaled model.  A ring or asymmetric tail cannot be represented by this
-    model and consequently loses similarity.  An elliptical but otherwise
-    clean Gaussian keeps high similarity and is penalized once, separately,
-    through circularity.
+    measured 2-D covariance.  Both measured intensity and model are normalized
+    to unit total energy; the returned similarity is one minus their
+    total-variation distance, ``1 - 0.5 * sum(abs(p - q))``.  Consequently a
+    weak ring or asymmetric tail cannot disappear inside an intensity-squared
+    objective: its integrated energy explicitly reduces the score.  An
+    elliptical but otherwise clean Gaussian keeps high similarity and is
+    penalized once, separately, through circularity.
 
     Empty, single-pixel, or otherwise unmeasurable spots return finite zero
     scores.  This lets an experimental scan finish and write its diagnostic
@@ -892,15 +895,36 @@ def _gaussian_round_metrics(
         raise ValueError("signal_patch and mask must have the same shape")
 
     local_y, local_x = np.nonzero(mask_array)
-    values = np.maximum(patch[mask_array], 0.0)
     invalid = _GaussianRoundMetrics(0.0, 0.0, 0.0, 0.0, False)
-    if values.size == 0:
+    if local_y.size == 0:
         return invalid
+
+    mask_y = local_y.astype(np.float64) + float(global_y_start)
+    mask_x = local_x.astype(np.float64) + float(global_x_start)
+    raw_values = np.maximum(patch[mask_array], 0.0)
+    equivalent_mask_radius = float(np.sqrt(raw_values.size / np.pi))
+    distance_from_expected = np.hypot(
+        mask_y - float(expected_center_y),
+        mask_x - float(expected_center_x),
+    )
+    outer_annulus = distance_from_expected >= 0.8 * equivalent_mask_radius
+    if np.any(outer_annulus):
+        outer_values = raw_values[outer_annulus]
+        local_background = float(np.median(outer_values))
+        noise_mad = 1.4826 * float(
+            np.median(np.abs(outer_values - local_background))
+        )
+    else:
+        local_background = 0.0
+        noise_mad = 0.0
+    values = np.maximum(raw_values - local_background, 0.0)
     spot_sum = float(np.sum(values, dtype=np.float64))
     squared_sum = float(np.dot(values, values))
     if not np.isfinite(spot_sum) or not np.isfinite(squared_sum):
         return invalid
     if spot_sum <= 0.0 or squared_sum <= 0.0:
+        return invalid
+    if noise_mad > 0.0 and float(np.max(values)) < 8.0 * noise_mad:
         return invalid
 
     # A lone hot pixel has no measurable two-dimensional shape and must not be
@@ -909,8 +933,6 @@ def _gaussian_round_metrics(
     if effective_pixel_count < 2.0:
         return invalid
 
-    mask_y = local_y.astype(np.float64) + float(global_y_start)
-    mask_x = local_x.astype(np.float64) + float(global_x_start)
     centroid_y = float(np.dot(values, mask_y) / spot_sum)
     centroid_x = float(np.dot(values, mask_x) / spot_sum)
     delta_y = mask_y - centroid_y
@@ -946,11 +968,18 @@ def _gaussian_round_metrics(
         principal_coordinates**2 / eigenvalues[None, :], axis=1
     )
     model = np.exp(-0.5 * mahalanobis_squared)
-    model_squared_sum = float(np.dot(model, model))
-    if model_squared_sum <= 0.0:
+    model_sum = float(np.sum(model, dtype=np.float64))
+    if not np.isfinite(model_sum) or model_sum <= 0.0:
         return invalid
-    projection = float(np.dot(values, model))
-    best_similarity = projection**2 / (squared_sum * model_squared_sum)
+    measured_distribution = values / spot_sum
+    model_distribution = model / model_sum
+    total_variation_distance = 0.5 * float(
+        np.sum(
+            np.abs(measured_distribution - model_distribution),
+            dtype=np.float64,
+        )
+    )
+    best_similarity = 1.0 - total_variation_distance
     equivalent_sigma = float(np.sqrt(np.sqrt(np.prod(eigenvalues))))
 
     centroid_offset = float(
@@ -1320,8 +1349,10 @@ def _write_experimental_plot(
         ("background_halo", "Background / halo fraction"),
         ("mean_spot_sharpness", "Mean spot sharpness"),
         ("valid_spot_fraction", "Valid fitted spot fraction"),
+        ("peak_intensity", "Peak intensity (camera counts)"),
+        ("saturation_fraction", "Saturated pixel fraction"),
     )
-    figure, axes = plt.subplots(4, 2, figsize=(10, 14), sharex=True)
+    figure, axes = plt.subplots(5, 2, figsize=(10, 17), sharex=True)
     for axis, (key, title) in zip(axes.flat, series):
         axis.plot(delta_z, [float(row[key]) for row in rows], "o-")
         axis.set_title(title)

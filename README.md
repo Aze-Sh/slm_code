@@ -114,6 +114,29 @@ python experimental_delta_z_scan.py `
 加载 phase → 等待 SLM/光路稳定 → AVT 连拍 → 帧平均 → 下一 delta_z
 ```
 
+### 只显示一个8×8 phase并拍摄一张曝光测试图
+
+下面的命令不会启动整轮扫描。它从已有 WGS 扫描目录中选择一个精确的
+`delta_z`，加载对应 BMP 到 SLM，等待稳定后抓取一张原始 AVT 帧，并分别打印
+整张 CCD 和指定阵列 ROI 内的最大灰度、最大值坐标、过曝像素数量及比例：
+
+```powershell
+python single_frame_exposure_test.py `
+  --scan-dir .\delta_z_scan_m200_p200_step10_v1 `
+  --delta-z-mm 0 `
+  --monitor 1 `
+  --camera-index 0 `
+  --exposure-us 23 `
+  --settle-seconds 1 `
+  --correction-bmp .\CAL_LSH0804730_785nm.bmp `
+  --roi 2250 1650 500 500 `
+  --saturation-level 255
+```
+
+每次运行会在 `single_frame_tests` 下新建带时间戳的子目录，保存原始 NPY、
+无损 TIFF、可直接查看的 PNG 和 `exposure_stats.json`，不会覆盖之前的测试。
+过曝判断应优先看 `Array ROI`；整帧过曝但 ROI 为零通常意味着阵列外存在热像素。
+
 终端会显示 `[acquire i/9]`、`[detect i/9]`、`[analyze i/9]` 和
 `[preview i/9]` 进度。平均帧采用逐帧 `float32` 累加，分析采用内存映射、先裁
 CCD ROI、再逐光斑小窗口计算；不会再同时创建 9 张 `float64` 副本、64 张全图

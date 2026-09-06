@@ -95,7 +95,7 @@ WGS，不使用上一点作为 warm start。输出包括：
 
 连接 SLM 与 CCD，关闭可能覆盖 SLM 第二屏的窗口。默认参数复用了原 AVT
 notebook 中已经工作过的设置：monitor 1、曝光 `50 µs`、每点 16 帧、加载后
-等待 1 秒。
+等待 5 秒。
 
 ```powershell
 python experimental_delta_z_scan.py `
@@ -105,7 +105,7 @@ python experimental_delta_z_scan.py `
   --camera-index 0 `
   --exposure-us 50 `
   --frames-per-point 16 `
-  --settle-seconds 1
+  --settle-seconds 5
 ```
 
 程序会按 `scan_000` 到 `scan_008` 的顺序执行：
@@ -113,6 +113,56 @@ python experimental_delta_z_scan.py `
 ```text
 加载 phase → 等待 SLM/光路稳定 → AVT 连拍 → 帧平均 → 下一 delta_z
 ```
+
+### 扫描前只做一次 CCD 反馈 WGS
+
+加入 `--feedback-iterations` 后，程序先选择最接近
+`--feedback-reference-delta-z-mm` 的一个参考相位，在这个参考点执行 notebook
+式 CCD 闭环：64 点 ROI 积分、计算 `CV=std/mean`、按实测强弱修正目标权重、
+重新运行 WGS。每次更新 SLM 后由 `--feedback-settle-seconds` 等待 5 秒再拍摄。
+
+这套 CCD 权重标定在整轮扫描前只执行一次，不会在每个 `delta_z` 重复。得到的
+同一组 64 点权重会固定下来；随后程序在正式拍照前，为每个 `delta_z` 分别进行
+一次数值 WGS，确保每张相位仍包含其对应的 Angular-Spectrum propagation。
+数值相位全部生成完后，才依次加载 SLM 并由 CCD 拍摄。
+
+例如对 `-200` 到 `+200 mm` 的已有离线扫描执行：
+
+```powershell
+.\.venv\Scripts\python.exe .\experimental_delta_z_scan.py `
+  --scan-dir .\delta_z_scan_m200_p200_step10_v1 `
+  --output-dir .\delta_z_experiment_m200_p200_feedback_23us_v1 `
+  --monitor 1 `
+  --camera-index 0 `
+  --exposure-us 23 `
+  --frames-per-point 16 `
+  --settle-seconds 5 `
+  --feedback-iterations 7 `
+  --feedback-settle-seconds 5 `
+  --feedback-reference-delta-z-mm 0 `
+  --camera-to-target-transform flip-xy `
+  --correction-bmp .\CAL_LSH0804730_785nm.bmp `
+  --roi 2250 1650 500 500 `
+  --expected-spots 64 `
+  --min-peak-distance-px 25 `
+  --spot-radius-px 15 `
+  --saturation-level 255 `
+  --exclude-zero-order
+```
+
+`flip-xy` 对应原 notebook 的 `np.flip(intensity)`。反馈阶段最多执行 7 次权重
+更新和 8 次测量；若提前达到 `CV < 0.001` 会提前停止。程序从所有反馈轮次中
+保留实测 CV 最低的一轮，避免后续校正偶然变差。中央零级光自动排除，不参与
+64 点权重更新、目标光斑过曝判定或最终质量评分。
+
+主要反馈输出包括：
+
+- `camera_feedback_history.csv`：每轮 CV、min/max、目标点峰值；
+- `camera_feedback_spots.png`：64 个反馈 ROI 和零级光排除圈；
+- `camera_feedback_target_amplitude.npy`：最终固定的 64 点权重；
+- `camera_feedback_calibrated_scan/`：用固定权重为所有 `delta_z` 独立生成的
+  NPY/BMP；
+- 根目录下的 `camera_average_*.npy/.tiff`：正式 delta-z 扫描照片。
 
 ### 只显示一个8×8 phase并拍摄一张曝光测试图
 
@@ -127,7 +177,7 @@ python single_frame_exposure_test.py `
   --monitor 1 `
   --camera-index 0 `
   --exposure-us 23 `
-  --settle-seconds 1 `
+  --settle-seconds 5 `
   --correction-bmp .\CAL_LSH0804730_785nm.bmp `
   --roi 2250 1650 500 500 `
   --saturation-level 255
@@ -320,7 +370,7 @@ python experimental_delta_z_scan.py `
   --monitor 1 `
   --exposure-us 50 `
   --frames-per-point 16 `
-  --settle-seconds 1
+  --settle-seconds 5
 ```
 
 coarse scan 和 fine scan 应保持同一套 CCD ROI、曝光、平均帧数、校正方式以及

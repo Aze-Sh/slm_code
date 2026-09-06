@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import time
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
@@ -29,6 +30,28 @@ class ScanPoint:
     delta_z_mm: float
     bmp_path: Path
     scan_label: str
+    phase_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class CameraFeedbackConfig:
+    """One pre-scan CCD calibration followed by fixed-weight delta-z WGS."""
+
+    initial_slm_amplitude: np.ndarray
+    initial_target_amplitude: np.ndarray
+    iterations: int
+    wgs_loops: int
+    wgs_threshold: float
+    cv_threshold: float
+    gain: float
+    camera_to_target_transform: str
+    wavelength_um: float
+    image_pixel_pitch_um: float
+    pupil_radius_mm: float
+    slm_active_shape_yx: tuple[int, int]
+    target_grid_shape_yx: tuple[int, int]
+    reference_delta_z_mm: float
+    settle_seconds: float
 
 
 @dataclass(frozen=True)
@@ -171,6 +194,21 @@ def load_scan_points(scan_dir: str | Path) -> list[ScanPoint]:
         if not bitmap_path.is_file():
             raise FileNotFoundError(f"scan BMP not found: {bitmap_path}")
 
+        phase_path = None
+        phase_name_value = row.get("phase_file")
+        if phase_name_value:
+            phase_name = Path(phase_name_value)
+            if phase_name.is_absolute() or len(phase_name.parts) != 1:
+                raise ValueError(
+                    "phase_file must be a filename inside the scan directory: "
+                    f"{phase_name}"
+                )
+            phase_path = scan_path / phase_name
+            if not phase_path.is_file():
+                raise FileNotFoundError(
+                    f"scan phase array not found: {phase_path}"
+                )
+
         prefix = "slm_phase_"
         if not bitmap_path.stem.startswith(prefix):
             raise ValueError(
@@ -181,6 +219,7 @@ def load_scan_points(scan_dir: str | Path) -> list[ScanPoint]:
                 delta_z_mm=delta_z_mm,
                 bmp_path=bitmap_path,
                 scan_label=bitmap_path.stem[len(prefix) :],
+                phase_path=phase_path,
             )
         )
     return points
@@ -562,6 +601,7 @@ def acquire_scan_points(
     lut: int,
     save_raw_frames: bool,
     saturation_level: float | None = None,
+    prepare_output_dir: bool = True,
     sleep_fn=time.sleep,
     progress_fn: ProgressFn = print,
 ) -> list[AcquiredPoint]:
@@ -575,7 +615,14 @@ def acquire_scan_points(
     if settle_seconds < 0:
         raise ValueError("settle_seconds must be non-negative")
 
-    output_path = _prepare_experiment_directory(output_dir)
+    if prepare_output_dir:
+        output_path = _prepare_experiment_directory(output_dir)
+    else:
+        output_path = Path(output_dir)
+        if not output_path.is_dir():
+            raise NotADirectoryError(
+                f"prepared experiment directory not found: {output_path}"
+            )
     display_size_xy = tuple(int(value) for value in display.getSize())
     if len(display_size_xy) != 2:
         raise ValueError("display getSize() must return (width, height)")
@@ -619,6 +666,593 @@ def acquire_scan_points(
             f"saturation={result.saturation_fraction:.3g})",
         )
     return acquired
+
+
+CAMERA_TO_TARGET_TRANSFORMS = (
+    "identity",
+    "flip-x",
+    "flip-y",
+    "flip-xy",
+    "transpose",
+    "transpose-flip-x",
+    "transpose-flip-y",
+    "transpose-flip-xy",
+)
+
+
+def _phase_radians_to_screen_bitmap(
+    phase: np.ndarray, active_size_xy: tuple[int, int]
+) -> np.ndarray:
+    """Crop a full WGS phase grid to the physical SLM and encode it as 8 bit."""
+    phase_array = np.asarray(phase)
+    if phase_array.ndim != 2:
+        raise ValueError("WGS phase must be two-dimensional")
+    active_width, active_height = active_size_xy
+    height, width = phase_array.shape
+    if active_width > width or active_height > height:
+        raise ValueError("physical SLM area must fit inside the WGS phase grid")
+    start_y = (height - active_height) // 2
+    start_x = (width - active_width) // 2
+    cropped = phase_array[
+        start_y : start_y + active_height,
+        start_x : start_x + active_width,
+    ]
+    return np.around((cropped + np.pi) / (2 * np.pi) * 256).astype(
+        np.uint8
+    )
+
+
+def _transform_camera_intensities(
+    intensities: np.ndarray,
+    grid_shape_yx: tuple[int, int],
+    transform: str,
+) -> np.ndarray:
+    """Map row-major CCD spot powers onto row-major target-array weights."""
+    if transform not in CAMERA_TO_TARGET_TRANSFORMS:
+        raise ValueError(f"unsupported camera-to-target transform: {transform}")
+    values = np.asarray(intensities, dtype=np.float64)
+    if values.ndim != 1 or values.size != int(np.prod(grid_shape_yx)):
+        raise ValueError("camera intensity count does not match target grid")
+    grid = values.reshape(grid_shape_yx)
+    if transform.startswith("transpose"):
+        grid = grid.T
+        suffix = transform[len("transpose") :].lstrip("-")
+    else:
+        suffix = transform
+    if suffix in ("flip-y", "flip-xy"):
+        grid = np.flip(grid, axis=0)
+    if suffix in ("flip-x", "flip-xy"):
+        grid = np.flip(grid, axis=1)
+    if grid.shape != grid_shape_yx:
+        raise ValueError(
+            "transposed camera grid does not match target grid; transpose is "
+            "only valid for a square array"
+        )
+    return np.asarray(grid, dtype=np.float64).reshape(-1)
+
+
+def _adapt_target_amplitude(
+    target_amplitude: np.ndarray,
+    camera_intensities: np.ndarray,
+    *,
+    gain: float,
+) -> np.ndarray:
+    """Apply the notebook's sqrt(mean measured intensity / measured intensity)."""
+    if not 0 < gain <= 1:
+        raise ValueError("feedback gain must be in (0, 1]")
+    target = np.asarray(target_amplitude, dtype=np.float64)
+    target_mask = target > 0
+    values = np.asarray(camera_intensities, dtype=np.float64)
+    if values.ndim != 1 or values.size != int(np.count_nonzero(target_mask)):
+        raise ValueError("camera intensity count does not match target spots")
+    if np.any(~np.isfinite(values)) or np.any(values < 0):
+        raise ValueError("camera intensities must be finite and non-negative")
+    mean_intensity = float(np.mean(values))
+    if mean_intensity <= 0:
+        raise ValueError("camera feedback found no target-array signal")
+
+    # A zero caused by noise/background subtraction must not create an
+    # unbounded correction.  This floor is far below a normally detected spot
+    # and only protects the closed loop from numerical blow-up.
+    safe_values = np.maximum(values, mean_intensity * 1e-6)
+    correction = np.power(mean_intensity / safe_values, 0.5 * gain)
+    adapted = target.copy()
+    adapted[target_mask] *= correction
+    norm = float(np.sqrt(np.sum(np.square(adapted))))
+    if not np.isfinite(norm) or norm <= 0:
+        raise ValueError("camera feedback produced an invalid target amplitude")
+    adapted /= norm
+    return adapted
+
+
+def _measure_feedback_spots(
+    image: np.ndarray,
+    spot_windows: Sequence[_SpotWindow],
+    *,
+    roi_xywh: tuple[int, int, int, int] | None,
+    background_percentile: float,
+    excluded_center_yx: tuple[float, float] | None = None,
+    excluded_radius_px: float | None = None,
+) -> tuple[np.ndarray, float, float]:
+    image_array = np.asarray(image)
+    roi_y_slice, roi_x_slice = _roi_slices(image_array.shape, roi_xywh)
+    signal = _background_correct(
+        image_array[roi_y_slice, roi_x_slice], background_percentile
+    )
+    signal[
+        _circular_exclusion_mask(
+            tuple(image_array.shape),
+            roi_xywh,
+            excluded_center_yx,
+            excluded_radius_px,
+        )
+    ] = 0.0
+    spot_sums = np.asarray(
+        [
+            float(
+                np.sum(
+                    signal[window.y_slice, window.x_slice][window.mask],
+                    dtype=np.float64,
+                )
+            )
+            for window in spot_windows
+        ],
+        dtype=np.float64,
+    )
+    mean_sum = float(np.mean(spot_sums))
+    cv = float(np.std(spot_sums) / mean_sum) if mean_sum > 0 else float("inf")
+    maximum = float(np.max(spot_sums))
+    uniformity = float(np.min(spot_sums) / maximum) if maximum > 0 else 0.0
+    return spot_sums, cv, uniformity
+
+
+def _display_and_capture_feedback_phase(
+    phase: np.ndarray,
+    display,
+    camera,
+    *,
+    active_size_xy: tuple[int, int],
+    display_size_xy: tuple[int, int],
+    expected_camera_shape: tuple[int, int] | None,
+    exposure_us: float,
+    frames_per_point: int,
+    settle_seconds: float,
+    correction: np.ndarray | None,
+    lut: int,
+    saturation_level: float | None,
+    sleep_fn,
+) -> tuple[_CameraAverage, np.ndarray, np.ndarray]:
+    phase_bitmap = _phase_radians_to_screen_bitmap(phase, active_size_xy)
+    calibrated = apply_slm_calibration(
+        phase_bitmap, correction=correction, lut=lut
+    )
+    display_frame = center_phase_on_display(calibrated, display_size_xy)
+    display.updateArray(display_frame)
+    sleep_fn(settle_seconds)
+    captured = _capture_camera_average(
+        camera,
+        exposure_us=exposure_us,
+        frames_per_point=frames_per_point,
+        expected_shape=expected_camera_shape,
+        saturation_level=saturation_level,
+        raw_frames_npy=None,
+    )
+    return captured, phase_bitmap, display_frame
+
+
+def _write_feedback_history(path: Path, rows: Sequence[dict[str, object]]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary.replace(path)
+
+
+def run_pre_scan_camera_feedback(
+    points: list[ScanPoint],
+    display,
+    camera,
+    output_path: Path,
+    feedback: CameraFeedbackConfig,
+    *,
+    exposure_us: float,
+    frames_per_point: int,
+    correction: np.ndarray | None,
+    lut: int,
+    saturation_level: float | None,
+    expected_spots: int,
+    roi_xywh: tuple[int, int, int, int] | None,
+    min_peak_distance_px: int,
+    spot_radius_px: float | None,
+    background_percentile: float,
+    exclude_zero_order: bool,
+    zero_order_xy: tuple[float, float] | None,
+    zero_order_radius_px: float | None,
+    sleep_fn=time.sleep,
+    progress_fn: ProgressFn = print,
+) -> tuple[np.ndarray, np.ndarray, ScanPoint, list[dict[str, object]]]:
+    """Calibrate one 64-site weight map before the mechanical-fixed scan."""
+    if feedback.iterations <= 0:
+        raise ValueError("feedback iterations must be positive")
+    if feedback.wgs_loops <= 0:
+        raise ValueError("feedback WGS loops must be positive")
+    if feedback.cv_threshold < 0:
+        raise ValueError("feedback CV threshold must be non-negative")
+    if feedback.settle_seconds < 0:
+        raise ValueError("feedback settle time must be non-negative")
+    if any(point.phase_path is None for point in points):
+        raise ValueError(
+            "camera feedback requires phase_file entries in the source "
+            "delta_z_metrics.csv; regenerate the offline delta-z scan"
+        )
+
+    display_size_xy = tuple(int(value) for value in display.getSize())
+    with Image.open(points[0].bmp_path) as first_bitmap:
+        active_size_xy = tuple(int(value) for value in first_bitmap.size)
+    reference_point = min(
+        points,
+        key=lambda point: abs(
+            point.delta_z_mm - feedback.reference_delta_z_mm
+        ),
+    )
+    assert reference_point.phase_path is not None
+    phase = np.asarray(
+        np.load(reference_point.phase_path, allow_pickle=False),
+        dtype=np.float64,
+    )
+    target = np.asarray(
+        feedback.initial_target_amplitude, dtype=np.float64
+    ).copy()
+    if phase.shape != target.shape:
+        raise ValueError("source phase and feedback target shapes do not match")
+    if int(np.count_nonzero(target)) != expected_spots:
+        raise ValueError(
+            "feedback target spot count does not match --expected-spots"
+        )
+
+    centers: np.ndarray | None = None
+    spot_windows: list[_SpotWindow] | None = None
+    feedback_target_mask: np.ndarray | None = None
+    camera_shape: tuple[int, int] | None = None
+    resolved_zero_center: tuple[float, float] | None = None
+    resolved_zero_radius: float | None = None
+    history_rows: list[dict[str, object]] = []
+    best_cv = float("inf")
+    best_iteration = -1
+    best_phase: np.ndarray | None = None
+    best_target: np.ndarray | None = None
+    best_capture: _CameraAverage | None = None
+
+    import torch
+    from WGS import WGS_phase_generate
+
+    for iteration in range(feedback.iterations + 1):
+        _report(
+            progress_fn,
+            f"[pre-scan feedback {iteration}/{feedback.iterations}] "
+            f"Displaying {reference_point.scan_label}; waiting "
+            f"{feedback.settle_seconds:g} s before CCD acquisition",
+        )
+        captured, _, _ = _display_and_capture_feedback_phase(
+            phase,
+            display,
+            camera,
+            active_size_xy=active_size_xy,
+            display_size_xy=display_size_xy,
+            expected_camera_shape=camera_shape,
+            exposure_us=exposure_us,
+            frames_per_point=frames_per_point,
+            settle_seconds=feedback.settle_seconds,
+            correction=correction,
+            lut=lut,
+            saturation_level=saturation_level,
+            sleep_fn=sleep_fn,
+        )
+        if camera_shape is None:
+            camera_shape = captured.frame_shape
+            (
+                centers,
+                resolved_zero_center,
+                resolved_zero_radius,
+            ) = _resolve_target_centers(
+                [captured.average],
+                expected_spots,
+                roi_xywh=roi_xywh,
+                min_peak_distance_px=min_peak_distance_px,
+                background_percentile=background_percentile,
+                exclude_zero_order=exclude_zero_order,
+                zero_order_xy=zero_order_xy,
+                zero_order_radius_px=zero_order_radius_px,
+                progress_fn=progress_fn,
+                report_prefix="pre-scan feedback",
+            )
+            resolved_spot_radius = (
+                _infer_spot_radius(centers)
+                if spot_radius_px is None
+                else float(spot_radius_px)
+            )
+            feedback_target_mask, spot_windows, _ = _build_spot_windows(
+                camera_shape, centers, resolved_spot_radius, roi_xywh
+            )
+            _write_spot_overlay(
+                captured.average,
+                centers,
+                resolved_spot_radius,
+                output_path / "camera_feedback_spots.png",
+                roi_xywh=roi_xywh,
+                excluded_center_yx=resolved_zero_center,
+                excluded_radius_px=resolved_zero_radius,
+                progress_fn=progress_fn,
+            )
+            _write_json_atomic(
+                output_path / "camera_feedback_spot_centers.json",
+                {
+                    "reference_scan_label": reference_point.scan_label,
+                    "reference_delta_z_mm": reference_point.delta_z_mm,
+                    "centers_yx": centers.tolist(),
+                    "spot_radius_px": resolved_spot_radius,
+                    "zero_order_excluded": exclude_zero_order,
+                    "zero_order_center_xy": (
+                        [resolved_zero_center[1], resolved_zero_center[0]]
+                        if resolved_zero_center is not None
+                        else None
+                    ),
+                    "zero_order_radius_px": resolved_zero_radius,
+                    "camera_to_target_transform": (
+                        feedback.camera_to_target_transform
+                    ),
+                },
+            )
+        assert spot_windows is not None and feedback_target_mask is not None
+        measured, cv, uniformity = _measure_feedback_spots(
+            captured.average,
+            spot_windows,
+            roi_xywh=roi_xywh,
+            background_percentile=background_percentile,
+            excluded_center_yx=resolved_zero_center,
+            excluded_radius_px=resolved_zero_radius,
+        )
+        roi_y_slice, roi_x_slice = _roi_slices(
+            captured.frame_shape, roi_xywh
+        )
+        scored_feedback_mask = feedback_target_mask & ~_circular_exclusion_mask(
+            captured.frame_shape,
+            roi_xywh,
+            resolved_zero_center,
+            resolved_zero_radius,
+        )
+        target_pixels = captured.average[
+            roi_y_slice, roi_x_slice
+        ][scored_feedback_mask]
+        target_peak = float(np.max(target_pixels))
+        target_saturation_fraction = (
+            float(
+                np.count_nonzero(
+                    target_pixels >= captured.effective_saturation_level
+                )
+                / target_pixels.size
+            )
+            if captured.effective_saturation_level is not None
+            else 0.0
+        )
+        mapped = _transform_camera_intensities(
+            measured,
+            feedback.target_grid_shape_yx,
+            feedback.camera_to_target_transform,
+        )
+        iteration_stem = f"camera_feedback_iteration_{iteration:03d}"
+        _save_numpy_atomic(output_path / f"{iteration_stem}.npy", captured.average)
+        _save_average_tiff(
+            captured.average,
+            output_path / f"{iteration_stem}.tiff",
+            captured.frame_dtype,
+        )
+        _save_preview_png(
+            captured.average, output_path / f"{iteration_stem}.png"
+        )
+        history_rows.append(
+            {
+                "feedback_iteration": iteration,
+                "reference_delta_z_mm": reference_point.delta_z_mm,
+                "spot_intensity_cv": cv,
+                "target_uniformity_min_over_max": uniformity,
+                "mean_spot_signal": float(np.mean(measured)),
+                "min_spot_signal": float(np.min(measured)),
+                "max_spot_signal": float(np.max(measured)),
+                "target_spot_peak_average_counts": target_peak,
+                "target_spot_saturation_fraction_average": (
+                    target_saturation_fraction
+                ),
+                "full_frame_peak_raw": captured.peak_raw,
+                "full_frame_saturation_fraction": captured.saturation_fraction,
+            }
+        )
+        _write_feedback_history(
+            output_path / "camera_feedback_history.csv", history_rows
+        )
+        _report(
+            progress_fn,
+            f"[pre-scan feedback {iteration}/{feedback.iterations}] "
+            f"CV={cv:.6f}, min/max={uniformity:.4f}, "
+            f"target peak={target_peak:g}, "
+            f"target saturation={target_saturation_fraction:.3g} "
+            f"(full-frame peak={captured.peak_raw:g}, diagnostic only)",
+        )
+        if cv < best_cv:
+            best_cv = cv
+            best_iteration = iteration
+            best_phase = phase.copy()
+            best_target = target.copy()
+            best_capture = captured
+        if cv <= feedback.cv_threshold or iteration == feedback.iterations:
+            break
+
+        target = _adapt_target_amplitude(target, mapped, gain=feedback.gain)
+        _report(
+            progress_fn,
+            "[pre-scan feedback] Updating the common 64-site weights with "
+            f"{feedback.wgs_loops} WGS loops at "
+            f"delta_z={reference_point.delta_z_mm:+.3f} mm",
+        )
+        phase_tensor = WGS_phase_generate(
+            torch.from_numpy(feedback.initial_slm_amplitude),
+            torch.from_numpy(phase),
+            torch.from_numpy(target),
+            Loop=feedback.wgs_loops,
+            threshold=feedback.wgs_threshold,
+            Plot=False,
+            delta_z_mm=reference_point.delta_z_mm,
+            wavelength_um=feedback.wavelength_um,
+            image_pixel_pitch_um=feedback.image_pixel_pitch_um,
+            pupil_radius_mm=feedback.pupil_radius_mm,
+            slm_active_shape=feedback.slm_active_shape_yx,
+        )
+        phase = phase_tensor.detach().cpu().numpy()
+
+    if best_phase is None or best_target is None or best_capture is None:
+        raise RuntimeError("pre-scan camera feedback produced no result")
+    _save_numpy_atomic(
+        output_path / "camera_feedback_target_amplitude.npy", best_target
+    )
+    _save_numpy_atomic(output_path / "camera_feedback_best_phase.npy", best_phase)
+    best_screen = _phase_radians_to_screen_bitmap(best_phase, active_size_xy)
+    Image.fromarray(best_screen, mode="L").save(
+        output_path / "camera_feedback_best_phase.bmp"
+    )
+    _write_json_atomic(
+        output_path / "camera_feedback_result.json",
+        {
+            "scope": "one calibration before the entire delta_z scan",
+            "best_iteration": best_iteration,
+            "best_spot_intensity_cv": best_cv,
+            "reference_scan_label": reference_point.scan_label,
+            "reference_delta_z_mm": reference_point.delta_z_mm,
+            "feedback_measurements": len(history_rows),
+            "feedback_wgs_updates": max(0, len(history_rows) - 1),
+            "settle_seconds_before_each_feedback_capture": (
+                feedback.settle_seconds
+            ),
+            "weights_reused_for_every_delta_z": True,
+            "zero_order_excluded": exclude_zero_order,
+        },
+    )
+    _report(
+        progress_fn,
+        f"[pre-scan feedback] Selected iteration {best_iteration} "
+        f"(CV={best_cv:.6f}); these weights will be fixed for all delta_z",
+    )
+    return best_target, best_phase, reference_point, history_rows
+
+
+def generate_fixed_weight_scan_points(
+    points: list[ScanPoint],
+    output_path: Path,
+    feedback: CameraFeedbackConfig,
+    calibrated_target: np.ndarray,
+    calibrated_reference_phase: np.ndarray,
+    reference_point: ScanPoint,
+    *,
+    progress_fn: ProgressFn = print,
+) -> list[ScanPoint]:
+    """Numerically re-run WGS once per delta-z with one fixed CCD weight map."""
+    from delta_z_scan import (
+        _calculate_metrics,
+        _simulate_intensity,
+        _write_metrics_plot,
+    )
+    import torch
+    from WGS import WGS_phase_generate
+
+    scan_path = output_path / "camera_feedback_calibrated_scan"
+    scan_path.mkdir()
+    initial_amplitude = torch.from_numpy(feedback.initial_slm_amplitude)
+    target_tensor = torch.from_numpy(calibrated_target)
+    rows: list[dict[str, float | str]] = []
+    calibrated_points: list[ScanPoint] = []
+    for index, point in enumerate(points, start=1):
+        assert point.phase_path is not None
+        if point.scan_label == reference_point.scan_label:
+            initial_phase = calibrated_reference_phase
+        else:
+            initial_phase = np.load(point.phase_path, allow_pickle=False)
+        _report(
+            progress_fn,
+            f"[pre-scan WGS {index}/{len(points)}] Generating "
+            f"{point.scan_label} with the fixed CCD-calibrated weights",
+        )
+        phase = WGS_phase_generate(
+            initial_amplitude.clone(),
+            torch.from_numpy(np.asarray(initial_phase, dtype=np.float64)),
+            target_tensor.clone(),
+            Loop=feedback.wgs_loops,
+            threshold=feedback.wgs_threshold,
+            Plot=False,
+            delta_z_mm=point.delta_z_mm,
+            wavelength_um=feedback.wavelength_um,
+            image_pixel_pitch_um=feedback.image_pixel_pitch_um,
+            pupil_radius_mm=feedback.pupil_radius_mm,
+            slm_active_shape=feedback.slm_active_shape_yx,
+        )
+        phase_cpu = phase.detach().cpu().numpy()
+        phase_name = f"slm_phase_{point.scan_label}.npy"
+        bitmap_name = f"slm_phase_{point.scan_label}.bmp"
+        _save_numpy_atomic(scan_path / phase_name, phase_cpu)
+        screen = _phase_radians_to_screen_bitmap(
+            phase_cpu,
+            (feedback.slm_active_shape_yx[1], feedback.slm_active_shape_yx[0]),
+        )
+        Image.fromarray(screen, mode="L").save(scan_path / bitmap_name)
+        intensity = _simulate_intensity(
+            initial_amplitude,
+            phase,
+            delta_z_mm=point.delta_z_mm,
+            wavelength_um=feedback.wavelength_um,
+            image_pixel_pitch_um=feedback.image_pixel_pitch_um,
+            pupil_radius_mm=feedback.pupil_radius_mm,
+            slm_active_shape=feedback.slm_active_shape_yx,
+        )
+        metrics = _calculate_metrics(intensity, target_tensor, 3)
+        rows.append(
+            {
+                "delta_z_mm": point.delta_z_mm,
+                **metrics,
+                "phase_file": phase_name,
+                "bmp_file": bitmap_name,
+            }
+        )
+        calibrated_points.append(
+            ScanPoint(
+                delta_z_mm=point.delta_z_mm,
+                bmp_path=scan_path / bitmap_name,
+                scan_label=point.scan_label,
+                phase_path=scan_path / phase_name,
+            )
+        )
+    with (scan_path / "delta_z_metrics.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    _write_metrics_plot(rows, scan_path / "metrics_vs_delta_z.png")
+    _write_json_atomic(
+        scan_path / "scan_parameters.json",
+        {
+            "generation": "independent WGS per delta_z before acquisition",
+            "camera_feedback_scope": "one reference calibration only",
+            "camera_feedback_reference_delta_z_mm": reference_point.delta_z_mm,
+            "fixed_target_amplitude": "../camera_feedback_target_amplitude.npy",
+            "wgs_loops_per_delta_z": feedback.wgs_loops,
+            "wgs_threshold": feedback.wgs_threshold,
+            "wavelength_um": feedback.wavelength_um,
+            "image_pixel_pitch_um": feedback.image_pixel_pitch_um,
+            "pupil_radius_mm": feedback.pupil_radius_mm,
+            "slm_active_shape_yx": list(feedback.slm_active_shape_yx),
+            "target_array_size": list(feedback.target_grid_shape_yx),
+        },
+    )
+    return calibrated_points
 
 
 def _validate_background_percentile(background_percentile: float) -> None:
@@ -784,6 +1418,97 @@ def detect_common_spots(
             "adjust the camera ROI or minimum peak distance"
         )
     return np.asarray(sorted(selected), dtype=int)
+
+
+def _resolve_target_centers(
+    images: Sequence[np.ndarray],
+    expected_spots: int,
+    *,
+    roi_xywh: tuple[int, int, int, int] | None,
+    min_peak_distance_px: int,
+    background_percentile: float,
+    exclude_zero_order: bool,
+    zero_order_xy: tuple[float, float] | None,
+    zero_order_radius_px: float | None,
+    progress_fn: ProgressFn,
+    report_prefix: str = "analysis",
+) -> tuple[
+    np.ndarray, tuple[float, float] | None, float | None
+]:
+    """Find the target array and, when requested, remove its zero order."""
+    preliminary_count = expected_spots + 1 if exclude_zero_order else expected_spots
+    try:
+        preliminary = detect_common_spots(
+            images,
+            preliminary_count,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            background_percentile=background_percentile,
+            progress_fn=progress_fn,
+        )
+    except ValueError:
+        if not exclude_zero_order:
+            raise
+        preliminary = detect_common_spots(
+            images,
+            expected_spots,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            background_percentile=background_percentile,
+            progress_fn=progress_fn,
+        )
+    if not exclude_zero_order:
+        return preliminary, None, None
+
+    if zero_order_xy is None:
+        array_midpoint = np.asarray(
+            [
+                np.median(preliminary[:, 0]),
+                np.median(preliminary[:, 1]),
+            ],
+            dtype=np.float64,
+        )
+        zero_center = tuple(
+            float(value)
+            for value in preliminary[
+                int(
+                    np.argmin(
+                        np.sum(
+                            np.square(preliminary - array_midpoint[None, :]),
+                            axis=1,
+                        )
+                    )
+                )
+            ]
+        )
+    else:
+        zero_center = (float(zero_order_xy[1]), float(zero_order_xy[0]))
+
+    if zero_order_radius_px is None:
+        differences = preliminary[:, None, :] - preliminary[None, :, :]
+        distances = np.sqrt(np.sum(np.square(differences), axis=-1))
+        np.fill_diagonal(distances, np.inf)
+        spacing = float(np.median(np.min(distances, axis=1)))
+        zero_radius = max(2.0, 0.4 * spacing)
+    else:
+        zero_radius = float(zero_order_radius_px)
+    _report(
+        progress_fn,
+        f"[{report_prefix}] Excluding zero order at "
+        f"x={zero_center[1]:.1f}, y={zero_center[0]:.1f}, "
+        f"radius={zero_radius:.1f} px",
+    )
+    centers = detect_common_spots(
+        images,
+        expected_spots,
+        roi_xywh=roi_xywh,
+        min_peak_distance_px=min_peak_distance_px,
+        background_percentile=background_percentile,
+        excluded_center_yx=zero_center,
+        excluded_radius_px=zero_radius,
+        progress_fn=progress_fn,
+    )
+    return centers, zero_center, zero_radius
 
 
 def _infer_spot_radius(centers: np.ndarray) -> float:
@@ -1465,7 +2190,7 @@ def _write_common_previews(
 
 
 def _write_spot_overlay(
-    acquired: Sequence[AcquiredPoint],
+    acquired: Sequence[AcquiredPoint] | np.ndarray,
     centers: np.ndarray,
     radius: float,
     path: Path,
@@ -1481,16 +2206,25 @@ def _write_spot_overlay(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Circle
 
-    image_shape = tuple(np.asarray(acquired[0].average).shape)
+    if isinstance(acquired, np.ndarray):
+        overlay_images = [("feedback reference", np.asarray(acquired))]
+    else:
+        overlay_images = [
+            (result.point.scan_label, np.asarray(result.average))
+            for result in acquired
+        ]
+    image_shape = tuple(overlay_images[0][1].shape)
     y_slice, x_slice = _roi_slices(image_shape, roi_xywh)
     reference = np.zeros(
         (y_slice.stop - y_slice.start, x_slice.stop - x_slice.start),
         dtype=np.float32,
     )
-    result_count = len(acquired)
-    for result_index, result in enumerate(acquired, start=1):
+    result_count = len(overlay_images)
+    for result_index, (label, source_image) in enumerate(
+        overlay_images, start=1
+    ):
         image = np.array(
-            np.asarray(result.average)[y_slice, x_slice],
+            source_image[y_slice, x_slice],
             dtype=np.float32,
             copy=True,
         )
@@ -1501,7 +2235,7 @@ def _write_spot_overlay(
         _report(
             progress_fn,
             f"[overlay {result_index}/{result_count}] Added "
-            f"{result.point.scan_label}",
+            f"{label}",
         )
     reference *= np.float32(1.0 / result_count)
 
@@ -1909,82 +2643,21 @@ def _analyze_and_write_results(
     """Run the shared memory-bounded analysis and write derived outputs."""
     _report(progress_fn, "[analysis] Detecting one common set of spot centers")
     detection_images = [result.average for result in acquired]
-    preliminary_count = expected_spots + 1 if exclude_zero_order else expected_spots
-    try:
-        centers = detect_common_spots(
-            detection_images,
-            preliminary_count,
-            roi_xywh=roi_xywh,
-            min_peak_distance_px=min_peak_distance_px,
-            background_percentile=background_percentile,
-            progress_fn=progress_fn,
-        )
-    except ValueError:
-        if not exclude_zero_order:
-            raise
-        centers = detect_common_spots(
-            detection_images,
-            expected_spots,
-            roi_xywh=roi_xywh,
-            min_peak_distance_px=min_peak_distance_px,
-            background_percentile=background_percentile,
-            progress_fn=progress_fn,
-        )
-    zero_order_center_yx = None
-    resolved_zero_order_radius = None
-    if exclude_zero_order:
-        if zero_order_xy is None:
-            # For the centered even-sized rectangular arrays used here, the
-            # undiffracted order lies at the geometric midpoint of the array.
-            # Median is robust if the preliminary top-N selection included the
-            # bright zero order and missed one outer target.
-            array_midpoint = np.asarray(
-                [np.median(centers[:, 0]), np.median(centers[:, 1])],
-                dtype=np.float64,
-            )
-            nearest_center = centers[
-                int(
-                    np.argmin(
-                        np.sum(
-                            np.square(centers - array_midpoint[None, :]),
-                            axis=1,
-                        )
-                    )
-                )
-            ]
-            zero_order_center_yx = tuple(
-                float(value) for value in nearest_center
-            )
-        else:
-            zero_order_center_yx = (
-                float(zero_order_xy[1]),
-                float(zero_order_xy[0]),
-            )
-        if zero_order_radius_px is None:
-            differences = centers[:, None, :] - centers[None, :, :]
-            distances = np.sqrt(np.sum(np.square(differences), axis=-1))
-            np.fill_diagonal(distances, np.inf)
-            spacing = float(np.median(np.min(distances, axis=1)))
-            resolved_zero_order_radius = max(2.0, 0.4 * spacing)
-        else:
-            resolved_zero_order_radius = float(zero_order_radius_px)
-        _report(
-            progress_fn,
-            "[analysis] Excluding zero order at "
-            f"x={zero_order_center_yx[1]:.1f}, "
-            f"y={zero_order_center_yx[0]:.1f}, "
-            f"radius={resolved_zero_order_radius:.1f} px",
-        )
-        centers = detect_common_spots(
-            detection_images,
-            expected_spots,
-            roi_xywh=roi_xywh,
-            min_peak_distance_px=min_peak_distance_px,
-            background_percentile=background_percentile,
-            excluded_center_yx=zero_order_center_yx,
-            excluded_radius_px=resolved_zero_order_radius,
-            progress_fn=progress_fn,
-        )
+    (
+        centers,
+        zero_order_center_yx,
+        resolved_zero_order_radius,
+    ) = _resolve_target_centers(
+        detection_images,
+        expected_spots,
+        roi_xywh=roi_xywh,
+        min_peak_distance_px=min_peak_distance_px,
+        background_percentile=background_percentile,
+        exclude_zero_order=exclude_zero_order,
+        zero_order_xy=zero_order_xy,
+        zero_order_radius_px=zero_order_radius_px,
+        progress_fn=progress_fn,
+    )
     _report(
         progress_fn,
         f"[analysis] Detected {len(centers)} spots; measuring scan points",
@@ -2128,6 +2801,7 @@ def run_experimental_scan(
     exclude_zero_order: bool = False,
     zero_order_xy: tuple[float, float] | None = None,
     zero_order_radius_px: float | None = None,
+    camera_feedback: CameraFeedbackConfig | None = None,
     monitor_index: int,
     camera_index: int,
     sleep_fn=time.sleep,
@@ -2142,21 +2816,78 @@ def run_experimental_scan(
     with Image.open(points[0].bmp_path) as first_bitmap:
         active_size_xy = tuple(int(value) for value in first_bitmap.size)
 
-    acquired = acquire_scan_points(
-        points,
-        display,
-        camera,
-        output_dir,
-        exposure_us=exposure_us,
-        frames_per_point=frames_per_point,
-        settle_seconds=settle_seconds,
-        correction=correction,
-        lut=lut,
-        save_raw_frames=save_raw_frames,
-        saturation_level=saturation_level,
-        sleep_fn=sleep_fn,
-        progress_fn=progress_fn,
-    )
+    scan_points = points
+    feedback_history: list[dict[str, object]] = []
+    if camera_feedback is not None:
+        output_path = _prepare_experiment_directory(output_dir)
+        (
+            calibrated_target,
+            calibrated_reference_phase,
+            reference_point,
+            feedback_history,
+        ) = run_pre_scan_camera_feedback(
+            points,
+            display,
+            camera,
+            output_path,
+            camera_feedback,
+            exposure_us=exposure_us,
+            frames_per_point=frames_per_point,
+            correction=correction,
+            lut=lut,
+            saturation_level=saturation_level,
+            expected_spots=expected_spots,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            spot_radius_px=spot_radius_px,
+            background_percentile=background_percentile,
+            exclude_zero_order=exclude_zero_order,
+            zero_order_xy=zero_order_xy,
+            zero_order_radius_px=zero_order_radius_px,
+            sleep_fn=sleep_fn,
+            progress_fn=progress_fn,
+        )
+        scan_points = generate_fixed_weight_scan_points(
+            points,
+            output_path,
+            camera_feedback,
+            calibrated_target,
+            calibrated_reference_phase,
+            reference_point,
+            progress_fn=progress_fn,
+        )
+        acquired = acquire_scan_points(
+            scan_points,
+            display,
+            camera,
+            output_path,
+            exposure_us=exposure_us,
+            frames_per_point=frames_per_point,
+            settle_seconds=settle_seconds,
+            correction=correction,
+            lut=lut,
+            save_raw_frames=save_raw_frames,
+            saturation_level=saturation_level,
+            prepare_output_dir=False,
+            sleep_fn=sleep_fn,
+            progress_fn=progress_fn,
+        )
+    else:
+        acquired = acquire_scan_points(
+            scan_points,
+            display,
+            camera,
+            output_dir,
+            exposure_us=exposure_us,
+            frames_per_point=frames_per_point,
+            settle_seconds=settle_seconds,
+            correction=correction,
+            lut=lut,
+            save_raw_frames=save_raw_frames,
+            saturation_level=saturation_level,
+            sleep_fn=sleep_fn,
+            progress_fn=progress_fn,
+        )
     try:
         return _analyze_and_write_results(
             acquired,
@@ -2188,6 +2919,21 @@ def run_experimental_scan(
                 "settle_seconds": settle_seconds,
                 "save_raw_frames": save_raw_frames,
                 "saturation_level": saturation_level,
+                "camera_feedback_enabled": camera_feedback is not None,
+                "camera_feedback_scope": (
+                    "one calibration before the entire scan"
+                    if camera_feedback is not None
+                    else None
+                ),
+                "camera_feedback_measurements": len(feedback_history),
+                "camera_feedback_settle_seconds": (
+                    camera_feedback.settle_seconds
+                    if camera_feedback is not None
+                    else None
+                ),
+                "camera_feedback_weights_fixed_across_delta_z": (
+                    camera_feedback is not None
+                ),
             },
         )
     finally:
@@ -2327,7 +3073,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--exposure-us", type=float, default=50.0)
     parser.add_argument("--frames-per-point", type=int, default=16)
-    parser.add_argument("--settle-seconds", type=float, default=1.0)
+    parser.add_argument("--settle-seconds", type=float, default=5.0)
     parser.add_argument(
         "--correction-bmp", default="CAL_LSH0804730_785nm.bmp"
     )
@@ -2375,6 +3121,39 @@ def build_parser() -> argparse.ArgumentParser:
             "nearest-neighbor target spacing."
         ),
     )
+    parser.add_argument(
+        "--feedback-iterations",
+        type=int,
+        default=0,
+        help=(
+            "Number of CCD weight-correction updates performed once before "
+            "the full delta-z scan. Zero preserves the original open-loop scan."
+        ),
+    )
+    parser.add_argument(
+        "--feedback-settle-seconds",
+        type=float,
+        default=5.0,
+        help="Wait after each feedback phase update before taking CCD frames.",
+    )
+    parser.add_argument(
+        "--feedback-reference-delta-z-mm",
+        type=float,
+        default=0.0,
+        help="Use the available scan point nearest this delta-z for calibration.",
+    )
+    parser.add_argument("--feedback-wgs-loops", type=int)
+    parser.add_argument("--feedback-cv-threshold", type=float, default=0.001)
+    parser.add_argument("--feedback-gain", type=float, default=1.0)
+    parser.add_argument(
+        "--camera-to-target-transform",
+        choices=CAMERA_TO_TARGET_TRANSFORMS,
+        default="flip-xy",
+        help=(
+            "Map row-major CCD spots to WGS target sites. flip-xy matches the "
+            "original notebook's np.flip(intensity)."
+        ),
+    )
     return parser
 
 
@@ -2410,6 +3189,96 @@ def _expected_spots_from_scan(
     return expected_spots
 
 
+def _build_camera_feedback_config(
+    scan_directory: Path,
+    *,
+    iterations: int,
+    wgs_loops: int | None,
+    cv_threshold: float,
+    gain: float,
+    camera_to_target_transform: str,
+    reference_delta_z_mm: float,
+    settle_seconds: float,
+) -> CameraFeedbackConfig:
+    if iterations <= 0:
+        raise ValueError("feedback iterations must be positive")
+    if settle_seconds < 0:
+        raise ValueError("feedback settle time must be non-negative")
+    if cv_threshold < 0:
+        raise ValueError("feedback CV threshold must be non-negative")
+    if not 0 < gain <= 1:
+        raise ValueError("feedback gain must be in (0, 1]")
+    if camera_to_target_transform not in CAMERA_TO_TARGET_TRANSFORMS:
+        raise ValueError("unsupported camera-to-target transform")
+    parameters = _load_source_scan_parameters(scan_directory)
+    if parameters is None:
+        raise FileNotFoundError(
+            "camera feedback requires scan_parameters.json in --scan-dir"
+        )
+    required = {
+        "loops",
+        "threshold",
+        "wavelength_um",
+        "image_pixel_pitch_um",
+        "pupil_radius_mm",
+        "slm_active_shape_yx",
+        "target_array_size",
+    }
+    missing = required.difference(parameters)
+    if missing:
+        raise ValueError(
+            "source scan parameters are missing camera-feedback fields: "
+            + ", ".join(sorted(missing))
+        )
+    repository_dir = Path(__file__).resolve().parent
+    original_cwd = Path.cwd()
+    try:
+        os.chdir(repository_dir)
+        from SLMGeneration import SLM_class
+
+        slm = SLM_class()
+        slm.image_init(Plot=False)
+        target = slm.target_generate(Lattice_type="Rec", Plot=False)
+    finally:
+        os.chdir(original_cwd)
+    target_grid_shape_yx = tuple(
+        int(value) for value in parameters["target_array_size"]
+    )
+    active_shape_yx = tuple(
+        int(value) for value in parameters["slm_active_shape_yx"]
+    )
+    if len(target_grid_shape_yx) != 2 or len(active_shape_yx) != 2:
+        raise ValueError("source scan array and SLM shapes must have two values")
+    configured_loops = (
+        int(parameters["loops"]) if wgs_loops is None else int(wgs_loops)
+    )
+    if configured_loops <= 0:
+        raise ValueError("feedback WGS loops must be positive")
+    if np.asarray(target).shape != np.asarray(slm.initGaussianAmp).shape:
+        raise ValueError("SLM amplitude and target grids do not match")
+    if int(np.count_nonzero(target)) != int(np.prod(target_grid_shape_yx)):
+        raise ValueError(
+            "current SLM target does not match source target_array_size"
+        )
+    return CameraFeedbackConfig(
+        initial_slm_amplitude=np.asarray(slm.initGaussianAmp),
+        initial_target_amplitude=np.asarray(target),
+        iterations=iterations,
+        wgs_loops=configured_loops,
+        wgs_threshold=float(parameters["threshold"]),
+        cv_threshold=cv_threshold,
+        gain=gain,
+        camera_to_target_transform=camera_to_target_transform,
+        wavelength_um=float(parameters["wavelength_um"]),
+        image_pixel_pitch_um=float(parameters["image_pixel_pitch_um"]),
+        pupil_radius_mm=float(parameters["pupil_radius_mm"]),
+        slm_active_shape_yx=active_shape_yx,
+        target_grid_shape_yx=target_grid_shape_yx,
+        reference_delta_z_mm=reference_delta_z_mm,
+        settle_seconds=settle_seconds,
+    )
+
+
 def _print_best_result(best: dict[str, float | str | bool]) -> None:
     provisional = bool(best.get("selection_is_provisional", False))
     prefix = "Provisional best delta_z" if provisional else "Best measured delta_z"
@@ -2419,13 +3288,15 @@ def _print_best_result(best: dict[str, float | str | bool]) -> None:
     )
     if provisional:
         print(
-            "WARNING: raw-frame saturation data were unavailable; check "
-            "the images for clipping before accepting this delta_z."
+            "WARNING: exact per-frame saturation inside the target-spot ROIs "
+            "was unavailable; check the target spots for clipping before "
+            "accepting this delta_z."
         )
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
     points = load_scan_points(args.scan_dir)
     scan_directory = Path(args.scan_dir)
     expected_spots = _expected_spots_from_scan(
@@ -2434,6 +3305,10 @@ def main(argv: list[str] | None = None) -> None:
     roi_xywh = tuple(args.roi) if args.roi is not None else None
 
     if args.analyze_existing is not None:
+        if args.feedback_iterations != 0:
+            parser.error(
+                "--feedback-iterations cannot be used with --analyze-existing"
+            )
         _, best = run_existing_analysis(
             points,
             args.analyze_existing,
@@ -2465,6 +3340,30 @@ def main(argv: list[str] | None = None) -> None:
             )
         correction_name = str(correction_path)
 
+    camera_feedback = None
+    exclude_zero_order = args.exclude_zero_order
+    if args.feedback_iterations < 0:
+        parser.error("--feedback-iterations must be non-negative")
+    if args.feedback_iterations > 0:
+        camera_feedback = _build_camera_feedback_config(
+            scan_directory,
+            iterations=args.feedback_iterations,
+            wgs_loops=args.feedback_wgs_loops,
+            cv_threshold=args.feedback_cv_threshold,
+            gain=args.feedback_gain,
+            camera_to_target_transform=args.camera_to_target_transform,
+            reference_delta_z_mm=args.feedback_reference_delta_z_mm,
+            settle_seconds=args.feedback_settle_seconds,
+        )
+        # A zero-order peak is not one of the target traps and must never be
+        # used to adapt the 64 WGS weights.
+        exclude_zero_order = True
+        print(
+            "Camera-feedback WGS enabled: one pre-scan calibration, "
+            f"{args.feedback_settle_seconds:g} s settle per update; "
+            "zero order excluded."
+        )
+
     from avt import VimbaCamera
 
     with ExitStack() as stack:
@@ -2491,13 +3390,14 @@ def main(argv: list[str] | None = None) -> None:
             spot_radius_px=args.spot_radius_px,
             background_percentile=args.background_percentile,
             maximum_saturation_fraction=args.maximum_saturation_fraction,
-            exclude_zero_order=args.exclude_zero_order,
+            exclude_zero_order=exclude_zero_order,
             zero_order_xy=(
                 tuple(args.zero_order_xy)
                 if args.zero_order_xy is not None
                 else None
             ),
             zero_order_radius_px=args.zero_order_radius_px,
+            camera_feedback=camera_feedback,
             monitor_index=args.monitor,
             camera_index=args.camera_index,
         )

@@ -233,6 +233,179 @@ def test_acquisition_rejects_mismatched_camera_shapes(scan_module, tmp_path):
         )
 
 
+def test_camera_feedback_calibrates_only_one_reference_before_scan(
+    scan_module, tmp_path
+):
+    source_points = _make_scan_points(scan_module, tmp_path)
+    points = []
+    for point in source_points:
+        phase_path = tmp_path / f"{point.scan_label}.npy"
+        np.save(phase_path, np.zeros((64, 64), dtype=np.float64))
+        points.append(
+            scan_module.ScanPoint(
+                point.delta_z_mm,
+                point.bmp_path,
+                point.scan_label,
+                phase_path,
+            )
+        )
+    centers = np.array([[20, 20], [20, 44], [44, 20], [44, 44]])
+    camera_frames = [
+        _gaussian_grid(
+            (64, 64), centers, sigma=1.2, amplitudes=[100, 80, 60, 40]
+        ),
+        _gaussian_grid(
+            (64, 64), centers, sigma=1.2, amplitudes=[80, 80, 80, 80]
+        ),
+    ]
+    initial_target = np.zeros((64, 64), dtype=np.float64)
+    initial_target[centers[:, 0], centers[:, 1]] = 0.5
+    feedback = scan_module.CameraFeedbackConfig(
+        initial_slm_amplitude=np.full((64, 64), 1 / 64, dtype=np.float64),
+        initial_target_amplitude=initial_target,
+        iterations=1,
+        wgs_loops=1,
+        wgs_threshold=0.01,
+        cv_threshold=0.0,
+        gain=1.0,
+        camera_to_target_transform="identity",
+        wavelength_um=0.795,
+        image_pixel_pitch_um=12.5,
+        pupil_radius_mm=100,
+        slm_active_shape_yx=(4, 6),
+        target_grid_shape_yx=(2, 2),
+        reference_delta_z_mm=0,
+        settle_seconds=5,
+    )
+    display = FakeDisplay((8, 4))
+    sleep_calls = []
+    output_dir = tmp_path / "feedback"
+    output_dir.mkdir()
+
+    target, _, reference, history = scan_module.run_pre_scan_camera_feedback(
+        points,
+        display,
+        FakeCamera(camera_frames),
+        output_dir,
+        feedback,
+        exposure_us=23,
+        frames_per_point=1,
+        correction=None,
+        lut=256,
+        saturation_level=255,
+        expected_spots=4,
+        roi_xywh=None,
+        min_peak_distance_px=8,
+        spot_radius_px=6,
+        background_percentile=5,
+        exclude_zero_order=False,
+        zero_order_xy=None,
+        zero_order_radius_px=None,
+        sleep_fn=sleep_calls.append,
+        progress_fn=None,
+    )
+
+    assert reference.delta_z_mm == pytest.approx(0)
+    assert len(display.frames) == 2
+    assert sleep_calls == [5, 5]
+    assert len(history) == 2
+    assert np.count_nonzero(target) == 4
+    assert (output_dir / "camera_feedback_target_amplitude.npy").is_file()
+    assert (output_dir / "camera_feedback_history.csv").is_file()
+
+
+def test_fixed_feedback_weights_are_reused_in_independent_delta_z_wgs(
+    scan_module, tmp_path, monkeypatch
+):
+    import delta_z_scan
+    import torch
+    import WGS
+
+    source_points = _make_scan_points(scan_module, tmp_path)
+    points = []
+    for point in source_points:
+        phase_path = tmp_path / f"{point.scan_label}.npy"
+        np.save(phase_path, np.zeros((8, 8), dtype=np.float64))
+        points.append(
+            scan_module.ScanPoint(
+                point.delta_z_mm,
+                point.bmp_path,
+                point.scan_label,
+                phase_path,
+            )
+        )
+    target = np.zeros((8, 8), dtype=np.float64)
+    target[2, 2] = 0.4
+    target[2, 5] = 0.5
+    target[5, 2] = 0.6
+    target[5, 5] = 0.7
+    feedback = scan_module.CameraFeedbackConfig(
+        initial_slm_amplitude=np.full((8, 8), 1 / 8, dtype=np.float64),
+        initial_target_amplitude=target,
+        iterations=1,
+        wgs_loops=3,
+        wgs_threshold=0.01,
+        cv_threshold=0,
+        gain=1,
+        camera_to_target_transform="identity",
+        wavelength_um=0.795,
+        image_pixel_pitch_um=12.5,
+        pupil_radius_mm=100,
+        slm_active_shape_yx=(4, 6),
+        target_grid_shape_yx=(2, 2),
+        reference_delta_z_mm=0,
+        settle_seconds=5,
+    )
+    calls = []
+
+    def fake_wgs(init_amp, init_phase, target_amp, **kwargs):
+        calls.append(
+            (
+                kwargs["delta_z_mm"],
+                target_amp.detach().cpu().numpy().copy(),
+            )
+        )
+        return init_phase.clone()
+
+    monkeypatch.setattr(WGS, "WGS_phase_generate", fake_wgs)
+    monkeypatch.setattr(
+        delta_z_scan,
+        "_simulate_intensity",
+        lambda *args, **kwargs: torch.ones((8, 8)),
+    )
+    monkeypatch.setattr(
+        delta_z_scan,
+        "_calculate_metrics",
+        lambda *args, **kwargs: {"wgs_error": 0.0},
+    )
+    monkeypatch.setattr(
+        delta_z_scan,
+        "_write_metrics_plot",
+        lambda rows, path: path.touch(),
+    )
+    output_dir = tmp_path / "generated"
+    output_dir.mkdir()
+
+    generated = scan_module.generate_fixed_weight_scan_points(
+        points,
+        output_dir,
+        feedback,
+        target,
+        np.zeros((8, 8), dtype=np.float64),
+        points[1],
+        progress_fn=None,
+    )
+
+    assert [call[0] for call in calls] == [-5.0, 0.0]
+    for _, used_target in calls:
+        np.testing.assert_array_equal(used_target, target)
+    assert len(generated) == 2
+    assert all(point.bmp_path.is_file() for point in generated)
+    assert (
+        output_dir / "camera_feedback_calibrated_scan" / "delta_z_metrics.csv"
+    ).is_file()
+
+
 def test_failed_raw_acquisition_never_exposes_partial_stack(
     scan_module, tmp_path
 ):
@@ -780,7 +953,10 @@ def test_cli_defaults_match_the_working_vimba_notebook(scan_module):
     assert args.camera_index == 0
     assert args.exposure_us == pytest.approx(50)
     assert args.frames_per_point == 16
-    assert args.settle_seconds == pytest.approx(1)
+    assert args.settle_seconds == pytest.approx(5)
+    assert args.feedback_iterations == 0
+    assert args.feedback_settle_seconds == pytest.approx(5)
+    assert args.camera_to_target_transform == "flip-xy"
     assert args.correction_bmp == "CAL_LSH0804730_785nm.bmp"
     assert args.lut == 224
     assert args.no_calibration is False

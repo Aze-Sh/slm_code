@@ -660,6 +660,26 @@ def _roi_slices(
     return slice(y, y + roi_height), slice(x, x + roi_width)
 
 
+def _circular_exclusion_mask(
+    image_shape: tuple[int, int],
+    roi_xywh: tuple[int, int, int, int] | None,
+    center_yx: tuple[float, float] | None,
+    radius_px: float | None,
+) -> np.ndarray:
+    """Return an ROI-local mask for light that analysis must ignore."""
+    y_slice, x_slice = _roi_slices(image_shape, roi_xywh)
+    shape = (int(y_slice.stop - y_slice.start), int(x_slice.stop - x_slice.start))
+    mask = np.zeros(shape, dtype=bool)
+    if center_yx is None:
+        return mask
+    if radius_px is None or radius_px <= 0:
+        raise ValueError("zero-order exclusion radius must be positive")
+    center_y, center_x = (float(value) for value in center_yx)
+    y = np.arange(y_slice.start, y_slice.stop, dtype=np.float64)[:, None]
+    x = np.arange(x_slice.start, x_slice.stop, dtype=np.float64)[None, :]
+    return (y - center_y) ** 2 + (x - center_x) ** 2 <= radius_px**2
+
+
 def detect_common_spots(
     images: Sequence[np.ndarray],
     expected_count: int,
@@ -667,6 +687,8 @@ def detect_common_spots(
     roi_xywh: tuple[int, int, int, int] | None = None,
     min_peak_distance_px: int = 8,
     background_percentile: float = 10.0,
+    excluded_center_yx: tuple[float, float] | None = None,
+    excluded_radius_px: float | None = None,
     progress_fn: ProgressFn = None,
 ) -> np.ndarray:
     """Detect fixed centers from an equal-weight, ROI-sized reference image."""
@@ -704,6 +726,13 @@ def detect_common_spots(
             "to common reference",
         )
     reference *= np.float32(1.0 / image_count)
+    excluded_mask = _circular_exclusion_mask(
+        first_shape,
+        roi_xywh,
+        excluded_center_yx,
+        excluded_radius_px,
+    )
+    reference[excluded_mask] = 0.0
 
     filter_size = 2 * min_peak_distance_px + 1
     local_maximum = ndimage.maximum_filter(
@@ -1004,6 +1033,8 @@ def analyze_acquired_points(
     spot_radius_px: float | None = None,
     roi_xywh: tuple[int, int, int, int] | None = None,
     background_percentile: float = 10.0,
+    excluded_center_yx: tuple[float, float] | None = None,
+    excluded_radius_px: float | None = None,
     progress_fn: ProgressFn = None,
 ) -> tuple[list[dict[str, float | str]], float]:
     """Measure each scan point with one fixed set of circular target ROIs."""
@@ -1028,6 +1059,15 @@ def analyze_acquired_points(
     )
     roi_y_slice, roi_x_slice = _roi_slices(image_shape, roi_xywh)
     roi_height, roi_width = target_mask.shape
+    excluded_mask = _circular_exclusion_mask(
+        image_shape,
+        roi_xywh,
+        excluded_center_yx,
+        excluded_radius_px,
+    )
+    scored_target_mask = target_mask & ~excluded_mask
+    if not np.any(scored_target_mask):
+        raise ValueError("zero-order exclusion removed every target spot ROI")
 
     rows: list[dict[str, float | str]] = []
     result_count = len(acquired)
@@ -1038,6 +1078,7 @@ def analyze_acquired_points(
             np.asarray(result.average)[roi_y_slice, roi_x_slice],
             background_percentile,
         )
+        signal[excluded_mask] = 0.0
         total_signal = float(np.sum(signal, dtype=np.float64))
         if total_signal <= 0:
             raise ValueError(
@@ -1069,10 +1110,27 @@ def analyze_acquired_points(
             else 1.0
         )
         target_signal = float(
-            np.sum(signal[target_mask], dtype=np.float64)
+            np.sum(signal[scored_target_mask], dtype=np.float64)
         )
         target_efficiency = target_signal / total_signal
         background_halo = 1.0 - target_efficiency
+
+        raw_roi = np.asarray(result.average)[roi_y_slice, roi_x_slice]
+        target_pixels = raw_roi[scored_target_mask]
+        target_peak = float(np.max(target_pixels))
+        if result.effective_saturation_level is None:
+            target_saturation_fraction = result.saturation_fraction
+            target_saturation_source = result.saturation_fraction_source
+            target_saturation_is_exact = result.saturation_fraction_is_exact
+        else:
+            target_saturation_fraction = float(
+                np.count_nonzero(
+                    target_pixels >= result.effective_saturation_level
+                )
+                / target_pixels.size
+            )
+            target_saturation_source = "camera_average_target_spot_rois"
+            target_saturation_is_exact = False
 
         row_sums = np.sum(signal, axis=1, dtype=np.float64)
         column_sums = np.sum(signal, axis=0, dtype=np.float64)
@@ -1190,7 +1248,9 @@ def analyze_acquired_points(
                 "spot_intensity_cv": spot_cv,
                 "target_efficiency": target_efficiency,
                 "background_halo": background_halo,
-                "peak_intensity": result.peak_raw,
+                "peak_intensity": target_peak,
+                "peak_intensity_source": "camera_average_target_spot_rois",
+                "full_frame_peak_intensity": result.peak_raw,
                 "saturation_fraction": result.saturation_fraction,
                 "saturation_fraction_source": (
                     result.saturation_fraction_source
@@ -1198,7 +1258,11 @@ def analyze_acquired_points(
                 "saturation_fraction_is_exact": (
                     result.saturation_fraction_is_exact
                 ),
-                "peak_intensity_source": result.peak_intensity_source,
+                "target_saturation_fraction": target_saturation_fraction,
+                "target_saturation_fraction_source": target_saturation_source,
+                "target_saturation_fraction_is_exact": (
+                    target_saturation_is_exact
+                ),
                 "centroid_x_px": centroid_x,
                 "centroid_y_px": centroid_y,
                 "peak_x_px": float(peak_x),
@@ -1302,7 +1366,9 @@ def rank_quality(
     eligible = []
     for row, score in zip(rows, quality_scores):
         row_copy: dict[str, float | str | bool] = dict(row)
-        saturation_fraction = float(row["saturation_fraction"])
+        saturation_fraction = float(
+            row.get("target_saturation_fraction", row["saturation_fraction"])
+        )
         row_is_eligible = bool(
             np.isfinite(saturation_fraction)
             and saturation_fraction <= maximum_saturation_fraction
@@ -1313,7 +1379,10 @@ def rank_quality(
         eligible.append(row_is_eligible)
     eligible_array = np.asarray(eligible, dtype=bool)
     if not np.any(eligible_array):
-        raise ValueError("all scan points are saturated; reduce the exposure")
+        raise ValueError(
+            "all scan points are saturated in target-spot ROIs; reduce the "
+            "exposure"
+        )
     eligible_scores = np.where(eligible_array, quality_scores, -np.inf)
     best_index = int(np.argmax(eligible_scores))
     return ranked_rows, ranked_rows[best_index]
@@ -1349,8 +1418,8 @@ def _write_experimental_plot(
         ("background_halo", "Background / halo fraction"),
         ("mean_spot_sharpness", "Mean spot sharpness"),
         ("valid_spot_fraction", "Valid fitted spot fraction"),
-        ("peak_intensity", "Peak intensity (camera counts)"),
-        ("saturation_fraction", "Saturated pixel fraction"),
+        ("peak_intensity", "Target-spot peak (average camera counts)"),
+        ("target_saturation_fraction", "Target-spot saturated fraction"),
     )
     figure, axes = plt.subplots(5, 2, figsize=(10, 17), sharex=True)
     for axis, (key, title) in zip(axes.flat, series):
@@ -1402,6 +1471,8 @@ def _write_spot_overlay(
     path: Path,
     *,
     roi_xywh: tuple[int, int, int, int] | None = None,
+    excluded_center_yx: tuple[float, float] | None = None,
+    excluded_radius_px: float | None = None,
     progress_fn: ProgressFn = None,
 ) -> None:
     import matplotlib
@@ -1464,6 +1535,27 @@ def _write_spot_overlay(
             fontsize=6,
             ha="center",
             va="center",
+        )
+    if excluded_center_yx is not None and excluded_radius_px is not None:
+        excluded_y, excluded_x = excluded_center_yx
+        axis.add_patch(
+            Circle(
+                (excluded_x, excluded_y),
+                excluded_radius_px,
+                fill=False,
+                edgecolor="cyan",
+                linewidth=2.0,
+                linestyle="--",
+            )
+        )
+        axis.text(
+            excluded_x,
+            excluded_y,
+            "zero order excluded",
+            color="cyan",
+            fontsize=7,
+            ha="center",
+            va="bottom",
         )
     axis.set_title("Common CCD spot ROIs used for every delta_z")
     figure.colorbar(image_handle, ax=axis, shrink=0.8)
@@ -1806,6 +1898,9 @@ def _analyze_and_write_results(
     spot_radius_px: float | None,
     background_percentile: float,
     maximum_saturation_fraction: float,
+    exclude_zero_order: bool = False,
+    zero_order_xy: tuple[float, float] | None = None,
+    zero_order_radius_px: float | None = None,
     run_parameters: dict[str, object],
     progress_fn: ProgressFn,
 ) -> tuple[
@@ -1813,14 +1908,83 @@ def _analyze_and_write_results(
 ]:
     """Run the shared memory-bounded analysis and write derived outputs."""
     _report(progress_fn, "[analysis] Detecting one common set of spot centers")
-    centers = detect_common_spots(
-        [result.average for result in acquired],
-        expected_spots,
-        roi_xywh=roi_xywh,
-        min_peak_distance_px=min_peak_distance_px,
-        background_percentile=background_percentile,
-        progress_fn=progress_fn,
-    )
+    detection_images = [result.average for result in acquired]
+    preliminary_count = expected_spots + 1 if exclude_zero_order else expected_spots
+    try:
+        centers = detect_common_spots(
+            detection_images,
+            preliminary_count,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            background_percentile=background_percentile,
+            progress_fn=progress_fn,
+        )
+    except ValueError:
+        if not exclude_zero_order:
+            raise
+        centers = detect_common_spots(
+            detection_images,
+            expected_spots,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            background_percentile=background_percentile,
+            progress_fn=progress_fn,
+        )
+    zero_order_center_yx = None
+    resolved_zero_order_radius = None
+    if exclude_zero_order:
+        if zero_order_xy is None:
+            # For the centered even-sized rectangular arrays used here, the
+            # undiffracted order lies at the geometric midpoint of the array.
+            # Median is robust if the preliminary top-N selection included the
+            # bright zero order and missed one outer target.
+            array_midpoint = np.asarray(
+                [np.median(centers[:, 0]), np.median(centers[:, 1])],
+                dtype=np.float64,
+            )
+            nearest_center = centers[
+                int(
+                    np.argmin(
+                        np.sum(
+                            np.square(centers - array_midpoint[None, :]),
+                            axis=1,
+                        )
+                    )
+                )
+            ]
+            zero_order_center_yx = tuple(
+                float(value) for value in nearest_center
+            )
+        else:
+            zero_order_center_yx = (
+                float(zero_order_xy[1]),
+                float(zero_order_xy[0]),
+            )
+        if zero_order_radius_px is None:
+            differences = centers[:, None, :] - centers[None, :, :]
+            distances = np.sqrt(np.sum(np.square(differences), axis=-1))
+            np.fill_diagonal(distances, np.inf)
+            spacing = float(np.median(np.min(distances, axis=1)))
+            resolved_zero_order_radius = max(2.0, 0.4 * spacing)
+        else:
+            resolved_zero_order_radius = float(zero_order_radius_px)
+        _report(
+            progress_fn,
+            "[analysis] Excluding zero order at "
+            f"x={zero_order_center_yx[1]:.1f}, "
+            f"y={zero_order_center_yx[0]:.1f}, "
+            f"radius={resolved_zero_order_radius:.1f} px",
+        )
+        centers = detect_common_spots(
+            detection_images,
+            expected_spots,
+            roi_xywh=roi_xywh,
+            min_peak_distance_px=min_peak_distance_px,
+            background_percentile=background_percentile,
+            excluded_center_yx=zero_order_center_yx,
+            excluded_radius_px=resolved_zero_order_radius,
+            progress_fn=progress_fn,
+        )
     _report(
         progress_fn,
         f"[analysis] Detected {len(centers)} spots; measuring scan points",
@@ -1831,6 +1995,8 @@ def _analyze_and_write_results(
         spot_radius_px=spot_radius_px,
         roi_xywh=roi_xywh,
         background_percentile=background_percentile,
+        excluded_center_yx=zero_order_center_yx,
+        excluded_radius_px=resolved_zero_order_radius,
         progress_fn=progress_fn,
     )
     ranked_rows, best = rank_quality(
@@ -1849,6 +2015,8 @@ def _analyze_and_write_results(
         resolved_spot_radius,
         output_path / "detected_spots.png",
         roi_xywh=roi_xywh,
+        excluded_center_yx=zero_order_center_yx,
+        excluded_radius_px=resolved_zero_order_radius,
         progress_fn=progress_fn,
     )
     _write_common_previews(
@@ -1856,7 +2024,8 @@ def _analyze_and_write_results(
     )
 
     selection_is_provisional = not all(
-        result.saturation_fraction_is_exact for result in acquired
+        bool(row.get("target_saturation_fraction_is_exact", False))
+        for row in ranked_rows
     )
     best_payload: dict[str, object] = {
         "delta_z_mm": float(best["delta_z_mm"]),
@@ -1865,16 +2034,18 @@ def _analyze_and_write_results(
         "selection_is_provisional": selection_is_provisional,
         "selection": (
             "Highest absolute mean per-spot Gaussian-round score among points "
-            "that did not exceed the configured saturation threshold. Each "
+            "whose target-spot ROIs did not exceed the configured saturation "
+            "threshold. Full-frame and excluded zero-order saturation do not "
+            "disqualify a point. Each "
             "spot score is covariance-matched Gaussian similarity multiplied "
             "by intensity-covariance circularity; missing spots score zero."
         ),
     }
     if selection_is_provisional:
         best_payload["warning"] = (
-            "Raw-frame saturation information was unavailable for at least "
-            "one scan point. Thresholding an averaged image is only an "
-            "estimate of per-frame saturation, so this selection is provisional."
+            "Exact per-frame saturation inside the target-spot ROIs was "
+            "unavailable for at least one scan point. Thresholding an averaged "
+            "target ROI is only an estimate, so this selection is provisional."
         )
     _write_json_atomic(output_path / "best_delta_z.json", best_payload)
 
@@ -1892,10 +2063,19 @@ def _analyze_and_write_results(
         "scan_count": len(acquired),
         "maximum_saturation_fraction": maximum_saturation_fraction,
         "saturation_fraction_source": saturation_source,
+        "ranking_saturation_scope": "target_spot_rois_only",
+        "full_frame_and_zero_order_saturation_excluded_from_ranking": True,
         "saturation_fraction_exact_for_all_points": (
             not selection_is_provisional
         ),
         "camera_roi_xywh": list(roi_xywh) if roi_xywh is not None else None,
+        "zero_order_excluded": exclude_zero_order,
+        "zero_order_center_xy": (
+            [zero_order_center_yx[1], zero_order_center_yx[0]]
+            if zero_order_center_yx is not None
+            else None
+        ),
+        "zero_order_exclusion_radius_px": resolved_zero_order_radius,
         "background_scope": "camera_roi",
         "expected_spots": expected_spots,
         "min_peak_distance_px": min_peak_distance_px,
@@ -1945,6 +2125,9 @@ def run_experimental_scan(
     spot_radius_px: float | None,
     background_percentile: float,
     maximum_saturation_fraction: float,
+    exclude_zero_order: bool = False,
+    zero_order_xy: tuple[float, float] | None = None,
+    zero_order_radius_px: float | None = None,
     monitor_index: int,
     camera_index: int,
     sleep_fn=time.sleep,
@@ -1984,6 +2167,9 @@ def run_experimental_scan(
             spot_radius_px=spot_radius_px,
             background_percentile=background_percentile,
             maximum_saturation_fraction=maximum_saturation_fraction,
+            exclude_zero_order=exclude_zero_order,
+            zero_order_xy=zero_order_xy,
+            zero_order_radius_px=zero_order_radius_px,
             progress_fn=progress_fn,
             run_parameters={
                 "analysis_mode": "live_hardware_scan",
@@ -2033,6 +2219,9 @@ def run_existing_analysis(
     spot_radius_px: float | None,
     background_percentile: float,
     maximum_saturation_fraction: float,
+    exclude_zero_order: bool = False,
+    zero_order_xy: tuple[float, float] | None = None,
+    zero_order_radius_px: float | None = None,
     progress_fn: ProgressFn = print,
 ) -> tuple[
     list[dict[str, float | str | bool]], dict[str, float | str | bool]
@@ -2064,6 +2253,9 @@ def run_existing_analysis(
             spot_radius_px=spot_radius_px,
             background_percentile=background_percentile,
             maximum_saturation_fraction=maximum_saturation_fraction,
+            exclude_zero_order=exclude_zero_order,
+            zero_order_xy=zero_order_xy,
+            zero_order_radius_px=zero_order_radius_px,
             progress_fn=progress_fn,
             run_parameters={
                 "analysis_mode": "existing_averages",
@@ -2157,6 +2349,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--maximum-saturation-fraction", type=float, default=0.001
     )
+    parser.add_argument(
+        "--exclude-zero-order",
+        action="store_true",
+        help=(
+            "Exclude the undiffracted zero order from spot detection, halo, "
+            "peak, centroid, saturation gating, and quality scoring."
+        ),
+    )
+    parser.add_argument(
+        "--zero-order-xy",
+        type=float,
+        nargs=2,
+        metavar=("X", "Y"),
+        help=(
+            "Optional full-camera zero-order center. Without it, the center "
+            "is estimated from the rectangular target-array midpoint."
+        ),
+    )
+    parser.add_argument(
+        "--zero-order-radius-px",
+        type=float,
+        help=(
+            "Zero-order exclusion radius. Default: 0.4 times the measured "
+            "nearest-neighbor target spacing."
+        ),
+    )
     return parser
 
 
@@ -2226,6 +2444,13 @@ def main(argv: list[str] | None = None) -> None:
             spot_radius_px=args.spot_radius_px,
             background_percentile=args.background_percentile,
             maximum_saturation_fraction=args.maximum_saturation_fraction,
+            exclude_zero_order=args.exclude_zero_order,
+            zero_order_xy=(
+                tuple(args.zero_order_xy)
+                if args.zero_order_xy is not None
+                else None
+            ),
+            zero_order_radius_px=args.zero_order_radius_px,
         )
         _print_best_result(best)
         return
@@ -2266,6 +2491,13 @@ def main(argv: list[str] | None = None) -> None:
             spot_radius_px=args.spot_radius_px,
             background_percentile=args.background_percentile,
             maximum_saturation_fraction=args.maximum_saturation_fraction,
+            exclude_zero_order=args.exclude_zero_order,
+            zero_order_xy=(
+                tuple(args.zero_order_xy)
+                if args.zero_order_xy is not None
+                else None
+            ),
+            zero_order_radius_px=args.zero_order_radius_px,
             monitor_index=args.monitor,
             camera_index=args.camera_index,
         )

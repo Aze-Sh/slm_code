@@ -710,6 +710,50 @@ def test_quality_ranking_excludes_saturated_scan_point(scan_module):
     assert best["delta_z_mm"] == pytest.approx(0.0)
 
 
+def test_quality_ranking_uses_target_spot_saturation_not_zero_order(
+    scan_module,
+):
+    row = {
+        "delta_z_mm": 0.0,
+        "target_plane_uniformity": 1.0,
+        "mean_spot_sharpness": 1.0,
+        "background_halo": 0.0,
+        "mean_fwhm_px": 1.0,
+        "saturation_fraction": 0.2,
+        "target_saturation_fraction": 0.0,
+    }
+
+    ranked, best = scan_module.rank_quality(
+        [row], maximum_saturation_fraction=0.001
+    )
+
+    assert ranked[0]["eligible_for_best"] is True
+    assert best["delta_z_mm"] == pytest.approx(0.0)
+
+
+def test_zero_order_exclusion_keeps_bright_center_out_of_spot_detection(
+    scan_module,
+):
+    expected_centers = np.array(
+        [[12, 12], [12, 36], [36, 12], [36, 36]], dtype=int
+    )
+    image = _gaussian_grid(
+        (49, 49), expected_centers, sigma=1.2, amplitudes=[100] * 4
+    )
+    image[24, 24] = 255
+
+    centers = scan_module.detect_common_spots(
+        [image],
+        expected_count=4,
+        min_peak_distance_px=7,
+        background_percentile=5,
+        excluded_center_yx=(24, 24),
+        excluded_radius_px=5,
+    )
+
+    np.testing.assert_allclose(centers, expected_centers, atol=1)
+
+
 def test_quality_ranking_rejects_an_all_saturated_scan(scan_module):
     row = {
         "delta_z_mm": 0.0,

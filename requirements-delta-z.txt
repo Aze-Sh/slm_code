@@ -3,4 +3,9 @@ numpy
 pillow
 scipy
 torch
+wxPython; platform_system == "Windows"
 zernike
+
+# Allied Vision recommends installing the matching VmbPy wheel bundled with
+# the local Vimba X installation. See README.md; a static version is not pinned
+# here because VmbPy must match the installed Vimba X C API and transport layer.
